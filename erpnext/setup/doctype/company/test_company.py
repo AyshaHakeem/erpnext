@@ -318,6 +318,25 @@ class TestCompany(ERPNextTestSuite):
 		for transaction in frappe.get_hooks("demo_transaction_doctypes"):
 			self.assertFalse(frappe.db.exists(frappe.unscrub(transaction), {"company": company_name}))
 
+	def test_demo_data_failure_is_propagated(self):
+		from erpnext.setup import demo
+
+		error_log = frappe._dict(name="test-demo-error")
+		with (
+			patch.object(frappe.db, "savepoint"),
+			patch.object(frappe.db, "rollback") as rollback,
+			patch.object(demo, "create_demo_company", side_effect=RuntimeError("demo setup failed")),
+			patch.object(frappe, "log_error", return_value=error_log) as log_error,
+			patch.object(demo, "log_demo_data_failed_notification") as notify,
+			patch("frappe.utils.telemetry.capture"),
+		):
+			with self.assertRaisesRegex(RuntimeError, "demo setup failed"):
+				demo.setup_demo_data("_Test Company")
+
+		rollback.assert_called_once_with(save_point="demo_data")
+		log_error.assert_called_once_with("Failed to create demo data")
+		notify.assert_called_once_with(error_log)
+
 
 def create_company_communication(doctype, docname):
 	comm = frappe.get_doc(

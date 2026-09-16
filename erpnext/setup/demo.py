@@ -32,6 +32,7 @@ def setup_demo_data(company_name):
 		error_log = frappe.log_error("Failed to create demo data")
 		log_demo_data_failed_notification(error_log)
 		capture("demo_data_creation_failed", "erpnext", properties={"exception": frappe.get_traceback()})
+		raise
 
 
 def log_demo_data_failed_notification(error_log):
