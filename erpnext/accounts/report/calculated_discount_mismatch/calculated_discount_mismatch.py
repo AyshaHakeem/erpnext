@@ -88,8 +88,7 @@ def get_data():
 		.where(VERSION.creation > LAST_MODIFIED_DATE_THRESHOLD)
 		.where(Tuple(VERSION.ref_doctype, VERSION.docname).isin(list(transactions_with_discount_percentage)))
 		.where(
-			VERSION.data.like('%"discount\\_amount"%')
-			| VERSION.data.like('%"additional\\_discount\\_percentage"%')
+			VERSION.data.like('%"discount_amount"%') | VERSION.data.like('%"additional_discount_percentage"%')
 		)
 		.orderby(VERSION.creation, order=Order.desc)
 		.run(as_dict=True)
