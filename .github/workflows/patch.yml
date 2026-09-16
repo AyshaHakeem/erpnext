@@ -121,6 +121,8 @@ jobs:
         env:
           DB: mariadb
           TYPE: server
+          FRAPPE_USER: AyshaHakeem
+          FRAPPE_BRANCH: sqlite-support
           # Anonymous git to github.com gets throttled to a 401; authenticate the clones.
           CI_GITHUB_TOKEN: ${{ github.token }}
 

@@ -21,9 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: frappe/frappe
+          repository: AyshaHakeem/frappe
           path: apps/frappe
-          ref: ${{ github.ref_name }}
+          ref: sqlite-support
 
       - uses: actions/checkout@v4
         with:
