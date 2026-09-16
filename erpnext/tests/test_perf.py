@@ -16,6 +16,16 @@ def _is_leading_index_column(doctype: str, field: str) -> bool:
 	from the pg_index catalog. Both check the same thing across engines.
 	"""
 	table = f"tab{doctype}"
+	if frappe.db.db_type == "sqlite":
+		# SQLite exposes index metadata through PRAGMA rather than SHOW INDEX. INDEXED_FIELDS
+		# contains trusted DocType names, but quote any embedded identifier quotes defensively.
+		quoted_table = table.replace('"', '""')
+		for index in frappe.db.sql(f'PRAGMA index_list("{quoted_table}")', as_dict=True):
+			quoted_index = index.name.replace('"', '""')
+			columns = frappe.db.sql(f'PRAGMA index_info("{quoted_index}")', as_dict=True)
+			if columns and columns[0].name == field:
+				return True
+		return False
 	if frappe.db.db_type == "postgres":
 		return bool(
 			frappe.db.sql(

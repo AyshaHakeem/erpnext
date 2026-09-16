@@ -646,9 +646,9 @@ class StatusUpdater(Document):
 				args["source_dt_value"] = (
 					frappe.db.sql(
 						"""
-						(select coalesce(sum({source_field}), 0)
+						select coalesce(sum({source_field}), 0)
 							from `tab{source_dt}` where `{join_field}`=%(detail_id)s
-							and (docstatus=1 {cond}) {extra_cond})
+							and (docstatus=1 {cond}) {extra_cond}
 				""".format(**args),
 						{"detail_id": args["detail_id"]},
 					)[0][0]
