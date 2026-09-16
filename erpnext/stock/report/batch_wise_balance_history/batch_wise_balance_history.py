@@ -140,6 +140,8 @@ def get_stock_ledger_entries(filters):
 	entries += get_stock_ledger_entries_for_batch_no(filters)
 	entries += get_stock_ledger_entries_for_batch_bundle(filters)
 
+	for entry in entries:
+		entry.posting_date = getdate(entry.posting_date)
 	return entries
 
 

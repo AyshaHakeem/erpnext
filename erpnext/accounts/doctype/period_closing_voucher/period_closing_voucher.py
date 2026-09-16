@@ -263,7 +263,8 @@ class PeriodClosingVoucher(AccountsController):
 			.where((sle.company == self.company) & (sle.posting_date <= self.period_end_date))
 		).run()
 
-		if last_change and last_change[0][0] and last_change[0][0] > closing_entry.modified:
+		last_changed_at = get_datetime(last_change[0][0]) if last_change and last_change[0][0] else None
+		if last_changed_at and last_changed_at > closing_entry.modified:
 			frappe.throw(
 				_(
 					"Stock transactions were created or modified after the Stock Closing Entry {0} was generated. Regenerate it before submitting the Period Closing Voucher."

@@ -353,7 +353,7 @@ class PaymentReconciliation(Document):
 								"reference_type": inv.voucher_type,
 								"reference_name": inv.voucher_no,
 								"amount": -(inv.outstanding_in_account_currency),
-								"posting_date": inv.posting_date,
+								"posting_date": getdate(inv.posting_date),
 								"currency": inv.currency,
 								"cost_center": inv.cost_center,
 								"remarks": inv.remarks,

@@ -1145,7 +1145,7 @@ class JobCard(Document):
 		jc = frappe.qb.DocType("Job Card")
 		jctl = frappe.qb.DocType("Job Card Time Log")
 
-		return (
+		time_data = (
 			frappe.qb.from_(jc)
 			.from_(jctl)
 			.select(Min(jctl.from_time).as_("start_time"), Max(jctl.to_time).as_("end_time"))
@@ -1157,6 +1157,12 @@ class JobCard(Document):
 				& (IfNull(jc.is_corrective_job_card, 0) == 0)
 			)
 		).run(as_dict=True)
+		if time_data:
+			time_data[0].start_time = (
+				get_datetime(time_data[0].start_time) if time_data[0].start_time else None
+			)
+			time_data[0].end_time = get_datetime(time_data[0].end_time) if time_data[0].end_time else None
+		return time_data
 
 	def update_wo_operation_row(
 		self, data, for_quantity, process_loss_qty, pending_qty, time_in_mins, time_data
