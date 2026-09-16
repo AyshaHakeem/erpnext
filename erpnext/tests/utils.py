@@ -3061,6 +3061,8 @@ class ERPNextTestSuite(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
 		cls.globalTestRecords = {}
+		frappe.set_user("Administrator")
+		cls.addClassCleanup(frappe.set_user, "Administrator")
 
 	def tearDown(self):
 		frappe.db.rollback()
