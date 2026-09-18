@@ -306,8 +306,13 @@ if [ "$DB" == "mariadb" ];then
     if [ "$db_host" != "127.0.0.1" ]; then
         sed -i "s/\"db_host\": \"127.0.0.1\"/\"db_host\": \"${db_host}\"/" ~/frappe-bench/sites/test_site/site_config.json
     fi
-else
+elif [ "$DB" == "postgres" ]; then
     cp -r "${GITHUB_WORKSPACE}/.github/helper/site_config_postgres.json" ~/frappe-bench/sites/test_site/site_config.json
+elif [ "$DB" == "sqlite" ]; then
+    cp -r "${GITHUB_WORKSPACE}/.github/helper/site_config_sqlite.json" ~/frappe-bench/sites/test_site/site_config.json
+else
+    echo "Unsupported database: $DB"
+    exit 1
 fi
 
 
@@ -365,6 +370,12 @@ if [ "${CI_SKIP_ERPNEXT_ASSETS:-0}" = "1" ]; then erpnext_get_app_args=(--skip-a
 run_ci_step "Get erpnext app" bench get-app erpnext "${GITHUB_WORKSPACE}" "${erpnext_get_app_args[@]}"
 
 if [ "$TYPE" == "server" ]; then run_ci_step "Setup dev requirements" bench setup requirements --dev; fi
+
+# SQLite permits only one writer. Keep Redis available for the test process, but do not start
+# background workers or HTTP processes that can write to the same database concurrently.
+if [ "$DB" == "sqlite" ]; then
+    sed -i '/^web:/d; /^worker[^:]*:/d' Procfile
+fi
 
 bench start >> ~/frappe-bench/bench_start.log 2>&1 &
 
