@@ -3045,7 +3045,7 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 			order_by="account",
 			as_list=1,
 		)
-		self.assertEqual(actual, expected)
+		self.assertSequenceEqual(actual, expected)
 
 	def test_prevents_fully_returned_invoice_with_zero_quantity(self):
 		from erpnext.controllers.sales_and_purchase_return import StockOverReturnError, make_return_doc

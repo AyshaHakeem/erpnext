@@ -1330,7 +1330,7 @@ class TestPaymentEntry(ERPNextTestSuite):
 			(paid_from, 0.0, 8440.0, 0.0, 100.0, 0.0, 100.0, "USD", 84.4),
 			("_Test Payable USD - _TC", 8440.0, 0.0, 100.0, 0.0, 100.0, 0.0, "USD", 84.4),
 		)
-		self.assertEqual(gl_entries, expected_gl_entries)
+		self.assertSequenceEqual(gl_entries, expected_gl_entries)
 
 	def test_multi_currency_payment_entry_with_taxes(self):
 		payment_entry = create_payment_entry(
@@ -1392,7 +1392,7 @@ class TestPaymentEntry(ERPNextTestSuite):
 			("_Test Payable USD - _TC", 1000.0, 0.0, 12.5, 0),
 		)
 
-		self.assertEqual(gl_entries, expected_gl_entries)
+		self.assertSequenceEqual(gl_entries, expected_gl_entries)
 
 	def test_payment_entry_with_inclusive_tax(self):
 		# inclusive tax built server-side: base_tax_amount is None until apply_taxes()

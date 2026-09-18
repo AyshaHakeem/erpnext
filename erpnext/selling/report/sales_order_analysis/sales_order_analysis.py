@@ -7,7 +7,7 @@ from collections import OrderedDict
 import frappe
 from frappe import _, qb
 from frappe.query_builder import Case, CustomFunction
-from frappe.query_builder.functions import Coalesce, DateDiff, Max, Sum
+from frappe.query_builder.functions import Coalesce, DateDiff, Max, Round, Sum
 from frappe.utils import date_diff, flt, getdate, nowdate
 
 
@@ -113,12 +113,16 @@ def get_so_elapsed_time(data):
 		dn = qb.DocType("Delivery Note")
 		dni = qb.DocType("Delivery Note Item")
 
-		# TO_SECONDS is MariaDB-only. On postgres, subtracting dates yields days, so multiply
-		# by 86400 for the equivalent second delta. so.transaction_date is neither aggregated nor
-		# in the GROUP BY, but it is selectable under postgres' strict GROUP BY because it is
-		# functionally dependent on the grouped so.name (a doctype's `name` is always the PK).
+		# TO_SECONDS is MariaDB-only. PostgreSQL date subtraction and SQLite JULIANDAY both
+		# produce a difference in days, so convert that difference to seconds. Round SQLite's
+		# floating-point Julian-day result to avoid values such as 86399.99999.
 		if frappe.db.db_type == "postgres":
 			elapsed_seconds = ((Max(dn.posting_date) - so.transaction_date) * 86400).as_("elapsed_seconds")
+		elif frappe.db.db_type == "sqlite":
+			julian_day = CustomFunction("JULIANDAY", ["date"])
+			elapsed_seconds = Round(
+				(julian_day(Max(dn.posting_date)) - julian_day(so.transaction_date)) * 86400
+			).as_("elapsed_seconds")
 		else:
 			to_seconds = CustomFunction("TO_SECONDS", ["date"])
 			elapsed_seconds = (to_seconds(Max(dn.posting_date)) - to_seconds(so.transaction_date)).as_(

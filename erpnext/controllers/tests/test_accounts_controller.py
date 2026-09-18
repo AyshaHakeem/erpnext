@@ -329,8 +329,10 @@ class TestAccountsController(ERPNextTestSuite):
 			)
 			.run(as_dict=True)[0]
 		)
-		self.assertEqual(outstanding, current_outstanding.outstanding)
-		self.assertEqual(outstanding_in_account_currency, current_outstanding.outstanding_in_account_currency)
+		self.assertAlmostEqual(outstanding, current_outstanding.outstanding)
+		self.assertAlmostEqual(
+			outstanding_in_account_currency, current_outstanding.outstanding_in_account_currency
+		)
 
 	def test_10_payment_against_sales_invoice(self):
 		# Sales Invoice in Foreign Currency

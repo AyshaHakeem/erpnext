@@ -1530,7 +1530,7 @@ class TestSalesInvoice(ERPNextTestSuite):
 			order_by="account, debit, credit",
 			as_list=1,
 		)
-		self.assertEqual(expected, res)
+		self.assertSequenceEqual(expected, res)
 
 	def test_pos_with_no_gl_entry_for_change_amount(self):
 		frappe.db.set_single_value("POS Settings", "post_change_gl_entries", 0)
@@ -5429,7 +5429,7 @@ class TestSalesInvoice(ERPNextTestSuite):
 			"stock_value_difference",
 		)
 
-		self.assertEqual(change_in_value, 13.02 * -1)
+		self.assertAlmostEqual(change_in_value, 13.02 * -1)
 
 		# with use serial and batch fields
 		si = create_sales_invoice(
@@ -5458,7 +5458,7 @@ class TestSalesInvoice(ERPNextTestSuite):
 			"stock_value_difference",
 		)
 
-		self.assertEqual(change_in_value, 13.02 * -1)
+		self.assertAlmostEqual(change_in_value, 13.02 * -1)
 
 		doc.db_set("do_not_use_batchwise_valuation", original_value)
 

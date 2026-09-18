@@ -1,0 +1,181 @@
+name: Server (SQLite)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-sqlite-develop-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  TZ: 'Asia/Kolkata'
+  NODE_ENV: "production"
+  PYTHON_VERSION: '3.14'
+  FRAPPE_TEST_WEB_SERVER: '0'
+  FRAPPE_TEST_BACKGROUND_WORKER: '0'
+  FRAPPE_TEST_SMTP_SERVER: '0'
+
+jobs:
+  setup:
+    name: Build & reinstall (setup)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check for valid Python & Merge Conflicts
+        run: |
+          python -m compileall -fq "${GITHUB_WORKSPACE}"
+          if grep -lr --exclude-dir=node_modules "^<<<<<<< " "${GITHUB_WORKSPACE}"
+              then echo "Found merge conflicts"
+              exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          check-latest: true
+
+      - name: Add to Hosts
+        run: echo "127.0.0.1 test_site" | sudo tee -a /etc/hosts
+
+      - name: Cache deps (uv/pip/npm/yarn)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.npm
+            ~/.cache/yarn
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/*requirements.txt', '**/pyproject.toml', '**/yarn.lock') }}
+          restore-keys: ${{ runner.os }}-deps-
+
+      - name: Install
+        run: bash ${GITHUB_WORKSPACE}/.github/helper/install.sh
+        env:
+          DB: sqlite
+          TYPE: server
+          # SQLite support is developed in the companion Frappe branch until it lands upstream.
+          FRAPPE_USER: AyshaHakeem
+          FRAPPE_BRANCH: sqlite-support
+          CI_GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Warm up test data
+        run: |
+          cd ~/frappe-bench/
+          bench --site test_site run-tests --lightmode --module erpnext.tests.bootstrap_test_data
+
+      - name: Package bench for test shards
+        run: |
+          tar czpf "${GITHUB_WORKSPACE}/bench.tar.gz" -C /home/runner \
+            --exclude='.git' --exclude='node_modules' frappe-bench
+          ls -lh "${GITHUB_WORKSPACE}/bench.tar.gz"
+
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-sqlite
+          path: bench.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  test:
+    name: Python Unit Tests
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        container: [1, 2, 3, 4]
+    steps:
+      - name: Download bench artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bench-sqlite
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Add to Hosts
+        run: echo "127.0.0.1 test_site" | sudo tee -a /etc/hosts
+
+      - name: Install shard runtime (bench CLI + Redis + wkhtmltopdf)
+        run: |
+          pip install frappe-bench
+          command -v redis-server >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq redis-server; }
+          if ! command -v wkhtmltopdf >/dev/null; then
+            wget -qO /tmp/wkhtmltox.deb https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-2/wkhtmltox_0.12.6.1-2.jammy_amd64.deb
+            sudo apt-get install -y -qq /tmp/wkhtmltox.deb
+          fi
+
+      - name: Untar bench
+        run: |
+          tar xzpf "${GITHUB_WORKSPACE}/bench.tar.gz" -C /home/runner
+          ls -ld /home/runner/frappe-bench
+
+      - name: Start Redis
+        run: |
+          cd ~/frappe-bench/
+          bench start > ~/frappe-bench/bench_start.log 2>&1 &
+          ports=$(python - <<'PY'
+          import json
+          import re
+
+          with open("sites/common_site_config.json") as config_file:
+              config = json.load(config_file)
+
+          for key in ("redis_cache", "redis_queue"):
+              if match := re.search(r":(\d+)", str(config.get(key, ""))):
+                  print(match.group(1))
+          PY
+          )
+          for port in $ports; do
+            up=0
+            for _ in $(seq 1 60); do
+              if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+                exec 3>&- 3<&-
+                up=1
+                break
+              fi
+              sleep 1
+            done
+            [ "$up" = "1" ] || { echo "Redis did not come up on port $port"; exit 1; }
+          done
+
+      - name: Run Tests
+        run: |
+          cd ~/frappe-bench/
+          # PDF rendering only needs the compiled assets. A static server avoids
+          # starting a second Frappe process that could contend for SQLite writes.
+          ( cd sites && nohup python3 -m http.server 8000 --bind 127.0.0.1 > ../static_assets.log 2>&1 & )
+          assets_ready=0
+          for _ in $(seq 1 15); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null; then
+              exec 3>&- 3<&-
+              assets_ready=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$assets_ready" = "1" ] || { cat static_assets.log; exit 1; }
+          bench --site test_site run-parallel-tests --lightmode --app erpnext \
+            --total-builds ${{ strategy.job-total }} \
+            --build-number ${{ matrix.container }}
+
+      - name: Show bench output
+        if: ${{ always() }}
+        run: cat ~/frappe-bench/bench_start.log || true
