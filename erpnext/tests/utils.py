@@ -209,7 +209,7 @@ class BootStrapTestData:
 
 		frappe.db.commit()  # nosemgrep
 
-		# DDL commands have implicit commit
+		# Persist the base records before creating schema-dependent fixtures.
 		# Dimensions
 		self.make_dimensions()
 
@@ -224,6 +224,11 @@ class BootStrapTestData:
 
 		# custom field
 		self.make_custom_field()
+
+		# The CI warm-up runs in a separate process from the test shards. Persist
+		# this final phase explicitly: unlike MariaDB, SQLite does not implicitly
+		# commit the schema changes made while creating test dimensions and DocTypes.
+		frappe.db.commit()  # nosemgrep
 
 	def update_system_settings(self):
 		system_settings = frappe.get_doc("System Settings")

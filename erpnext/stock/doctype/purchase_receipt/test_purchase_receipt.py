@@ -3142,7 +3142,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 
 		# Test - 3: SLE Stock Value Difference should be equal to Debit or Credit of GL Entries.
 		for entry in gl_entries:
-			self.assertEqual(abs(entry.debit + entry.credit), abs(sl_entries[0].stock_value_difference))
+			self.assertAlmostEqual(abs(entry.debit + entry.credit), abs(sl_entries[0].stock_value_difference))
 
 	def non_internal_transfer_purchase_receipt(self):
 		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse

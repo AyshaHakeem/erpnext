@@ -159,6 +159,19 @@ jobs:
       - name: Run Tests
         run: |
           cd ~/frappe-bench/
+          # PDF rendering only needs the compiled assets. A static server avoids
+          # starting a second Frappe process that could contend for SQLite writes.
+          ( cd sites && nohup python3 -m http.server 8000 --bind 127.0.0.1 > ../static_assets.log 2>&1 & )
+          assets_ready=0
+          for _ in $(seq 1 15); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8000) 2>/dev/null; then
+              exec 3>&- 3<&-
+              assets_ready=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$assets_ready" = "1" ] || { cat static_assets.log; exit 1; }
           bench --site test_site run-parallel-tests --lightmode --app erpnext \
             --total-builds ${{ strategy.job-total }} \
             --build-number ${{ matrix.container }}

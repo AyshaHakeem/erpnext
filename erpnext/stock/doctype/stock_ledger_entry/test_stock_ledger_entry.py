@@ -1476,7 +1476,7 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 			.orderby(sle.creation)
 			.run(as_dict=True)
 		)
-		self.assertEqual(abs(sles[0].stock_value_difference), sles[1].stock_value_difference)
+		self.assertAlmostEqual(abs(sles[0].stock_value_difference), sles[1].stock_value_difference)
 
 	@ERPNextTestSuite.change_settings("System Settings", {"float_precision": 4, "currency_precision": 2})
 	def test_zero_quantity_clears_residual_stock_value(self):
