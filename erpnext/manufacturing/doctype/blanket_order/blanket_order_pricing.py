@@ -7,10 +7,13 @@ from frappe import _
 from frappe.utils import cint, flt
 
 from erpnext import get_company_currency
+from erpnext.accounts.doctype.pricing_rule.pricing_rule import validate_pricing_parties
 from erpnext.accounts.party import get_default_price_list as get_party_default_price_list
 from erpnext.accounts.services.taxes import validate_conversion_rate
 from erpnext.setup.utils import get_exchange_rate
 from erpnext.stock.get_item_details import get_price_list_rate_for
+
+BLANKET_RATE_DOCTYPES = ("Sales Order", "Quotation", "Purchase Order")
 
 _ORDER_TYPE_CONFIG = {
 	"Selling": {
@@ -32,6 +35,15 @@ _ORDER_TYPE_CONFIG = {
 		"settings_doctype": "Buying Settings",
 	},
 }
+
+
+def get_effective_base_rate(item, price_list_rate) -> float:
+	"""Blanket order rate in the row's UOM if the row has one, else the price list rate."""
+	if item.parenttype in BLANKET_RATE_DOCTYPES and item.blanket_order_rate:
+		return flt(
+			item.blanket_order_rate * (flt(item.conversion_factor) or 1), item.precision("price_list_rate")
+		)
+	return flt(price_list_rate)
 
 
 def get_order_type_config(blanket_order_type):
@@ -79,6 +91,8 @@ def set_price_list(doc, set_default=False, force_exchange_rate=False):
 	company_currency = get_company_currency(doc.company)
 	if doc.price_list_currency == company_currency:
 		doc.plc_conversion_rate = 1.0
+	elif doc.price_list_currency == doc.currency:
+		doc.plc_conversion_rate = doc.conversion_rate
 	elif price_list_currency_changed or not doc.plc_conversion_rate or force_exchange_rate:
 		doc.plc_conversion_rate = get_exchange_rate_to_company(doc, doc.price_list_currency)
 
@@ -191,6 +205,8 @@ def apply_price_list(
 	reset_conversion_rate=False,
 ):
 	doc = frappe.get_doc(frappe.parse_json(doc))
+	doc.check_permission("read")
+	validate_pricing_parties(doc)
 	reset_party_values = cint(reset_party_values)
 	reset_plc_conversion_rate = cint(reset_plc_conversion_rate)
 	reset_conversion_rate = cint(reset_conversion_rate)

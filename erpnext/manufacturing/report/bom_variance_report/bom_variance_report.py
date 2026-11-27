@@ -4,6 +4,13 @@
 
 import frappe
 from frappe import _
+from frappe.utils import flt
+
+from erpnext.manufacturing.doctype.work_order.services.required_items import (
+	distribute_over_rows,
+	get_consumed_qty_by_work_order,
+)
+from erpnext.stock.doctype.company_restriction.company_restriction import get_allowed_companies_condition
 
 
 def execute(filters=None):
@@ -65,11 +72,7 @@ def get_columns(filters):
 
 def get_data(filters):
 	wo = frappe.qb.DocType("Work Order")
-	query = (
-		frappe.qb.from_(wo)
-		.select(wo.name.as_("work_order"), wo.qty, wo.produced_qty, wo.production_item, wo.bom_no)
-		.where((wo.produced_qty > wo.qty) & (wo.docstatus == 1))
-	)
+	query = get_work_order_query(["name as work_order", "qty", "produced_qty", "production_item", "bom_no"])
 
 	if filters.get("bom_no") and not filters.get("work_order"):
 		query = query.where(wo.bom_no == filters.get("bom_no"))
@@ -77,18 +80,75 @@ def get_data(filters):
 	if filters.get("work_order"):
 		query = query.where(wo.name == filters.get("work_order"))
 
-	results = []
-	for d in query.run(as_dict=True):
-		results.append(d)
+	work_orders = query.run(as_dict=True)
+	materials = get_materials_by_work_order([d.work_order for d in work_orders])
+	planned_loss = get_planned_loss_percentage({d.bom_no for d in work_orders})
 
-		for data in frappe.get_all(
-			"Work Order Item",
-			fields=["item_code as raw_material_code", "required_qty", "consumed_qty"],
-			filters={"parent": d.work_order, "parenttype": "Work Order"},
-		):
+	results = []
+	for d in work_orders:
+		results.append(d)
+		expected_output = flt(d.qty) * (1 - flt(planned_loss.get(d.bom_no)) / 100)
+		for data in materials.get(d.work_order, []):
+			data.required_qty = flt(data.required_qty) * flt(d.produced_qty) / (expected_output or flt(d.qty))
 			results.append(data)
 
 	return results
+
+
+def get_planned_loss_percentage(boms):
+	return frappe._dict(
+		frappe.get_all(
+			"BOM",
+			filters={"name": ("in", list(boms))},
+			fields=["name", "process_loss_percentage"],
+			as_list=True,
+		)
+	)
+
+
+def get_work_order_query(fields):
+	wo = frappe.qb.DocType("Work Order")
+	query = frappe.qb.get_query(
+		"Work Order",
+		fields=fields,
+		filters={"docstatus": 1, "produced_qty": [">", 0]},
+		ignore_permissions=False,
+	)
+
+	if condition := get_allowed_companies_condition(wo.company, "Work Order"):
+		query = query.where(condition)
+
+	return query
+
+
+def get_materials_by_work_order(work_orders):
+	if not work_orders:
+		return {}
+
+	materials = {}
+	for row in frappe.get_all(
+		"Work Order Item",
+		fields=["name", "parent", "item_code", "required_qty"],
+		filters={"parent": ["in", work_orders], "parenttype": "Work Order"},
+		order_by="idx",
+	):
+		materials.setdefault(row.pop("parent"), []).append(row)
+
+	set_consumed_qty(materials)
+	return materials
+
+
+def set_consumed_qty(materials):
+	# stored consumed_qty includes returns on newer Work Orders only, so read it from stock entries
+	if not materials:
+		return
+
+	consumed = get_consumed_qty_by_work_order(list(materials))
+	for work_order, rows in materials.items():
+		consumed_by_row = distribute_over_rows(rows, consumed.get(work_order, {}))
+		for row in rows:
+			row.consumed_qty = consumed_by_row[row.pop("name")]
+			row.raw_material_code = row.pop("item_code")
 
 
 @frappe.whitelist()
@@ -96,9 +156,8 @@ def get_data(filters):
 def get_work_orders(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	wo = frappe.qb.DocType("Work Order")
 	query = (
-		frappe.qb.from_(wo)
-		.select(wo.name)
-		.where((wo.name.like(f"{txt}%")) & (wo.produced_qty > wo.qty) & (wo.docstatus == 1))
+		get_work_order_query(["name"])
+		.where(wo.name.like(f"{txt}%"))
 		.orderby(wo.name)
 		.limit(page_len)
 		.offset(start)

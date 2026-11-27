@@ -19,18 +19,9 @@ frappe.ui.form.on("Accounting Dimension Filter", {
 			return {
 				filters: {
 					company: frm.doc.company,
+					is_group: 0,
 				},
 			};
-		});
-
-		frappe.db.get_list("Accounting Dimension", { fields: ["document_type"] }).then((res) => {
-			let options = ["Cost Center", "Project"];
-
-			res.forEach((dimension) => {
-				options.push(dimension.document_type);
-			});
-
-			frm.set_df_property("accounting_dimension", "options", options);
 		});
 
 		frm.trigger("setup_filters");
@@ -41,7 +32,10 @@ frappe.ui.form.on("Accounting Dimension Filter", {
 
 		if (frm.doc.accounting_dimension) {
 			frappe.model.with_doctype(frm.doc.accounting_dimension, function () {
-				if (frappe.model.is_tree(frm.doc.accounting_dimension)) {
+				if (
+					frappe.model.is_tree(frm.doc.accounting_dimension) &&
+					frappe.meta.has_field(frm.doc.accounting_dimension, "is_group")
+				) {
 					filters["is_group"] = 0;
 				}
 

@@ -1,10 +1,12 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe.utils import add_days, flt, nowdate
 
-from erpnext.accounts.doctype.account.test_account import get_inventory_account
+from erpnext.accounts.doctype.account.test_account import create_account, get_inventory_account
 from erpnext.accounts.doctype.journal_entry.journal_entry import StockAccountInvalidTransaction
 from erpnext.exceptions import InvalidAccountCurrency
 from erpnext.selling.doctype.customer.test_customer import make_customer, set_credit_limit
@@ -14,6 +16,27 @@ from erpnext.tests.utils import ERPNextTestSuite
 class TestJournalEntry(ERPNextTestSuite):
 	def setUp(self):
 		self.load_test_records("Journal Entry")
+
+	def test_unregistered_party_type_on_untyped_account_is_rejected(self):
+		account = create_account(
+			account_name="_Test Party Type Untyped",
+			parent_account=frappe.get_value("Account", "Debtors - _TC", "parent_account"),
+			company="_Test Company",
+		)
+		journal = make_journal_entry(account, "_Test Cash - _TC", 10, save=False)
+		journal.accounts[0].update({"party_type": "User", "party": "Administrator"})
+		self.assertRaises(frappe.ValidationError, journal.insert)
+
+	def test_registered_party_type_on_untyped_account_is_accepted(self):
+		account = create_account(
+			account_name="_Test Party Type Untyped",
+			parent_account=frappe.get_value("Account", "Debtors - _TC", "parent_account"),
+			company="_Test Company",
+		)
+		journal = make_journal_entry(account, "_Test Cash - _TC", 10, save=False)
+		journal.accounts[0].update({"party_type": "Customer", "party": "_Test Customer"})
+		journal.insert().submit()
+		self.assertTrue(frappe.db.exists("GL Entry", {"voucher_no": journal.name, "party_type": "Customer"}))
 
 	@ERPNextTestSuite.change_settings("Accounts Settings", {"unlink_payment_on_cancellation_of_invoice": 1})
 	def test_journal_entry_with_against_jv(self):
@@ -384,6 +407,24 @@ class TestJournalEntry(ERPNextTestSuite):
 		self.assertEqual(jv.inter_company_journal_entry_reference, "")
 		self.assertEqual(jv1.inter_company_journal_entry_reference, "")
 
+	def test_validate_account_company_mismatch_on_save(self):
+		# Switching Company after the accounts table is filled in (without updating the
+		# accounts to match) must be rejected on save -- previously this only surfaced as a
+		# GL Entry error on submit, letting a mismatched draft sit around silently.
+		jv = make_journal_entry(
+			"Sales Expenses - _TC",
+			"Buildings - _TC",
+			100,
+			posting_date=nowdate(),
+			cost_center="Main - _TC",
+			save=True,
+		)
+
+		jv.company = "_Test Company 1"
+		for row in jv.accounts:
+			row.cost_center = "Main - _TC1"
+		self.assertRaises(frappe.ValidationError, jv.save)
+
 	def test_jv_with_cost_centre(self):
 		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center
 
@@ -513,6 +554,18 @@ class TestJournalEntry(ERPNextTestSuite):
 		self.assertEqual(
 			jv.pay_to_recd_from, frappe.db.get_value("Journal Entry", jv.name, "pay_to_recd_from")
 		)
+
+	def test_cancel_large_entry_queued_in_background(self):
+		jv = make_journal_entry("_Test Cash - _TC", "_Test Bank - _TC", 100, save=False)
+		for row in jv.accounts * 50:
+			jv.append("accounts", row.as_dict(no_default_fields=True))
+		jv.insert()
+
+		with patch.object(jv.meta, "queue_in_background", 1):
+			jv.submit()
+			jv.cancel()
+
+		self.assertEqual(frappe.db.get_value("Journal Entry", jv.name, "docstatus"), 2)
 
 	def test_jv_account_and_party_balance_with_cost_centre(self):
 		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center
@@ -820,6 +873,26 @@ class TestJournalEntry(ERPNextTestSuite):
 		self.assertEqual(jv.reference_totals[invoice.name], 100.0)
 		self.assertEqual(jv.reference_types[invoice.name], "Sales Invoice")
 		self.assertEqual(jv.reference_accounts[invoice.name], "Debtors - _TC")
+
+	def test_get_outstanding_requires_read_on_referenced_invoice(self):
+		from erpnext.accounts.doctype.journal_entry.journal_entry import get_outstanding
+		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+
+		invoice = create_sales_invoice(rate=500)
+		args = {"doctype": "Sales Invoice", "docname": invoice.name, "company": "_Test Company"}
+		self.assertEqual(get_outstanding(**args)["party"], invoice.customer)
+
+		# Sales User reads Account but not Sales Invoice
+		user = "test_je_outstanding_sales_user@example.com"
+		if not frappe.db.exists("User", user):
+			sales_user = frappe.new_doc("User")
+			sales_user.email = user
+			sales_user.first_name = "JE Outstanding"
+			sales_user.append("roles", {"role": "Sales User"})
+			sales_user.insert(ignore_permissions=True)
+
+		with self.set_user(user):
+			self.assertRaises(frappe.PermissionError, get_outstanding, **args)
 
 	def make_jv_against_purchase_invoice(self, invoice, amount=100):
 		jv = make_journal_entry("Creditors - _TC", "_Test Cash - _TC", amount, save=False)

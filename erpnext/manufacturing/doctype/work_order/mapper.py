@@ -11,21 +11,25 @@ the controller; work_order.py re-exports them for backward compatibility.
 import json
 import math
 from functools import partial
+from itertools import groupby
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
+from frappe.query_builder.functions import Coalesce, IfNull
 from frappe.utils import cint, flt, get_link_to_form, nowdate
 
-from erpnext.manufacturing.doctype.bom.bom import get_bom_item_rate
+from erpnext.manufacturing.doctype.bom.bom import get_backflush_based_on
 from erpnext.stock.doctype.item.item import get_item_defaults
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+from erpnext.stock.get_item_details import get_conversion_factor
+from erpnext.stock.serial_batch_identity import SerialBatchIdentity
 
 
 @frappe.whitelist()
 def get_item_details(item: str, project: str | None = None, skip_bom_info: bool = False, throw: bool = True):
-	frappe.has_permission("Item", "read", throw=True)
+	frappe.has_permission("Item", "read", doc=item, throw=True)
 
 	res = _item_master_details(item)
 	if not res:
@@ -163,9 +167,13 @@ def _add_variant_row(item, wo_doc, bom_no, table_name):
 	bom_doc = frappe.get_cached_doc("BOM", bom_no)
 	args = _variant_item_args(item, wo_doc, bom_doc)
 
-	existing_row = (
-		get_template_rm_item(wo_doc, item.get("item_code")) if table_name == "required_items" else None
-	)
+	if table_name != "required_items":
+		# bom rows are costed per row uom, work order rows per stock uom
+		args["rate"] = flt(args.rate * args.conversion_factor, frappe.get_precision("BOM Item", "rate"))
+		wo_doc.append(table_name, args)
+		return
+
+	existing_row = get_template_rm_item(wo_doc, item.get("item_code"))
 	if existing_row:
 		existing_row.update(args)
 	else:
@@ -175,26 +183,41 @@ def _add_variant_row(item, wo_doc, bom_no, table_name):
 def _variant_item_args(item, wo_doc, bom_doc):
 	args = frappe._dict(
 		item_code=item.get("variant_item_code"),
-		required_qty=item.get("qty"),
-		qty=item.get("qty"),  # for bom
 		source_warehouse=item.get("source_warehouse"),
 		operation=item.get("operation"),
 	)
 	item_data = get_item_details(args.item_code, skip_bom_info=True)
 	args.update(item_data)
+	args.update(_variant_row_qty(args.item_code, item, item_data.stock_uom))
 
-	args["rate"] = _variant_item_rate(args, wo_doc, bom_doc)
+	args["rate"] = get_raw_material_rate(args, wo_doc, bom_doc)
 	if not args.source_warehouse:
 		default = get_item_defaults(item.get("variant_item_code"), wo_doc.company)
 		args["source_warehouse"] = default.default_warehouse
 
 	args["amount"] = flt(args.get("required_qty")) * flt(args.get("rate"))
-	args["uom"] = item_data.stock_uom
 	return args
 
 
-def _variant_item_rate(args, wo_doc, bom_doc):
-	return get_bom_item_rate(
+def _variant_row_qty(item_code, item, stock_uom):
+	"""The dialog qty is in the template row's uom; the work order needs the stock qty."""
+	uom = item.get("uom") or stock_uom
+	conversion_factor = flt(get_conversion_factor(item_code, uom)["conversion_factor"])
+	stock_qty = flt(
+		flt(item.get("qty")) * conversion_factor, frappe.get_precision("Work Order Item", "required_qty")
+	)
+	return {
+		"qty": flt(item.get("qty")),  # for bom
+		"uom": uom,
+		"conversion_factor": conversion_factor,
+		"stock_qty": stock_qty,
+		"required_qty": stock_qty,
+	}
+
+
+def get_raw_material_rate(args, wo_doc, bom_doc):
+	"""Rate in company currency, costed the way the BOM costs its raw materials."""
+	rate = bom_doc.get_rm_rate(
 		{
 			"company": wo_doc.company,
 			"item_code": args.get("item_code"),
@@ -202,9 +225,11 @@ def _variant_item_rate(args, wo_doc, bom_doc):
 			"uom": args.get("stock_uom"),
 			"stock_uom": args.get("stock_uom"),
 			"conversion_factor": 1,
+			"source_warehouse": args.get("source_warehouse"),
 		},
-		bom_doc,
+		notify=False,
 	)
+	return rate * flt(bom_doc.conversion_rate or 1)
 
 
 def get_template_rm_item(wo_doc, item_code):
@@ -238,7 +263,7 @@ def make_stock_entry(
 ):
 	frappe.has_permission("Stock Entry", "create", throw=True)
 
-	work_order = frappe.get_doc("Work Order", work_order_id)
+	work_order = frappe.get_doc("Work Order", work_order_id, check_permission="read")
 	stock_entry = _new_manufacture_stock_entry(work_order, purpose, qty)
 	_set_stock_entry_warehouses(stock_entry, work_order, purpose, target_warehouse, source_stock_entry)
 
@@ -260,10 +285,92 @@ def _new_manufacture_stock_entry(work_order, purpose, qty):
 	if purpose in ["Material Transfer for Manufacture", "Manufacture"]:
 		stock_entry.subcontracting_inward_order = work_order.subcontracting_inward_order
 	# accept 0 qty as well
-	stock_entry.fg_completed_qty = (
-		qty if qty is not None else (flt(work_order.qty) - flt(work_order.produced_qty))
-	)
+	if qty is None:
+		qty = (
+			get_pending_consumption_qty(work_order)
+			if purpose == "Material Consumption for Manufacture"
+			else flt(work_order.qty) - flt(work_order.produced_qty)
+		)
+	stock_entry.fg_completed_qty = qty
 	return stock_entry
+
+
+def get_pending_consumption_qty(work_order):
+	"""The qty still to consume, measured the way the consumption entry picks its materials."""
+	if (
+		not work_order.skip_transfer
+		and get_backflush_based_on(work_order.bom_no) == "Material Transferred for Manufacture"
+	):
+		return get_pending_consumption_qty_based_on_transfer(work_order)
+
+	return get_pending_consumption_qty_based_on_bom(work_order)
+
+
+def get_pending_consumption_qty_based_on_bom(work_order):
+	"""The qty the materials left for the order cover, as the consumption entry takes each per the BOM,
+	at most what is left to produce."""
+	basis_field = "required_qty" if work_order.skip_transfer else "transferred_qty"
+	materials = {}
+	for row in work_order.required_items:
+		if (row.include_item_in_manufacturing or row.is_additional_item) and flt(row.required_qty) > 0:
+			material = materials.setdefault(row.item_code, frappe._dict(left_qty=0.0, required_qty=0.0))
+			material.left_qty += flt(row.get(basis_field)) - flt(row.consumed_qty)
+			material.required_qty += flt(row.required_qty)
+
+	left_for_qty = min(
+		(material.left_qty * flt(work_order.qty) / material.required_qty for material in materials.values()),
+		default=0,
+	)
+	pending_to_produce = flt(work_order.qty) - flt(work_order.produced_qty) - flt(work_order.process_loss_qty)
+	# round down, so the proposal never needs more than is left
+	step = 10 ** work_order.precision("qty")
+	return max(math.floor(flt(min(left_for_qty, pending_to_produce) * step, 9)) / step, 0)
+
+
+def get_pending_consumption_qty_based_on_transfer(work_order):
+	"""A material left in WIP is pending for the transferred qty less the For Quantity of the entries
+	that consumed it, as the consumption entry counts it. One already covered is drained by any qty,
+	so it is pending for what is left to produce."""
+	precision = work_order.precision("qty")
+	transferred_qty = flt(work_order.material_transferred_for_manufacturing)
+	pending_to_produce = transferred_qty - flt(work_order.produced_qty) - flt(work_order.process_loss_qty)
+	covered_qty = get_covered_qty_by_item(work_order.name)
+	pending_qty = max(
+		(
+			max(flt(transferred_qty - covered_qty.get(row.item_code, 0), precision), 0) or pending_to_produce
+			for row in work_order.required_items
+			if flt(flt(row.transferred_qty) - flt(row.consumed_qty), row.precision("consumed_qty")) > 0
+		),
+		default=0,
+	)
+	return max(flt(min(pending_qty, pending_to_produce), precision), 0)
+
+
+def get_covered_qty_by_item(work_order):
+	stock_entry = frappe.qb.DocType("Stock Entry")
+	detail = frappe.qb.DocType("Stock Entry Detail")
+	entries = (
+		frappe.qb.from_(stock_entry)
+		.inner_join(detail)
+		.on(detail.parent == stock_entry.name)
+		.select(
+			Coalesce(detail.original_item, detail.item_code).as_("item_code"),
+			stock_entry.name,
+			stock_entry.fg_completed_qty,
+		)
+		.distinct()
+		.where(
+			(stock_entry.work_order == work_order)
+			& (stock_entry.docstatus == 1)
+			& stock_entry.purpose.isin(["Manufacture", "Material Consumption for Manufacture"])
+			& (IfNull(detail.s_warehouse, "") != "")
+		)
+	).run(as_dict=True)
+
+	covered_qty = {}
+	for entry in entries:
+		covered_qty[entry.item_code] = covered_qty.get(entry.item_code, 0) + flt(entry.fg_completed_qty)
+	return covered_qty
 
 
 def _set_stock_entry_warehouses(stock_entry, work_order, purpose, target_warehouse, source_stock_entry):
@@ -293,7 +400,7 @@ def _set_stock_entry_warehouses(stock_entry, work_order, purpose, target_warehou
 def get_fg_conversion_details(work_order: str):
 	from erpnext.stock.doctype.stock_entry.services.manufacturing import (
 		get_alternative_finished_goods,
-		get_converted_fg_qty,
+		get_available_fg_qty,
 	)
 
 	if not work_order or not isinstance(work_order, str):
@@ -301,13 +408,11 @@ def get_fg_conversion_details(work_order: str):
 
 	frappe.has_permission("Work Order", "read", doc=work_order, throw=True)
 
-	wo_details = frappe.db.get_value(
-		"Work Order", work_order, ["production_item", "produced_qty"], as_dict=True
-	)
+	production_item = frappe.db.get_value("Work Order", work_order, "production_item")
 
 	return {
-		"alternative_items": get_alternative_finished_goods(wo_details.production_item),
-		"available_qty": flt(wo_details.produced_qty) - get_converted_fg_qty(work_order),
+		"alternative_items": get_alternative_finished_goods(production_item),
+		"available_qty": get_available_fg_qty(work_order),
 	}
 
 
@@ -392,12 +497,57 @@ def get_operation_details(name, work_order, parent_bom):
 				"finished_good": row.finished_good,
 				"bom_no": row.get("bom_no") or parent_bom,
 				"is_subcontracted": row.get("is_subcontracted"),
+				"output_qty": row.output_qty,
 			}
+
+
+def get_operation_qty(work_order, operation):
+	if work_order.get("track_semi_finished_goods") and flt(operation.get("output_qty")):
+		return flt(operation.get("output_qty"))
+
+	return flt(work_order.get("qty"))
+
+
+def get_upstream_process_loss(work_order, operation=None):
+	"""Loss before an operation, or before finished goods when no operation is supplied."""
+	if work_order.get("track_semi_finished_goods"):
+		return 0
+
+	process_loss_qty = 0
+	available_qty = None
+	for sequence_id, rows in groupby(
+		sorted(work_order.get("operations") or [], key=lambda row: cint(row.sequence_id)),
+		key=lambda row: cint(row.sequence_id),
+	):
+		if operation is not None and sequence_id >= cint(operation.get("sequence_id")):
+			break
+
+		rows = list(rows)
+		# Cap new loss at the previous output; legacy cards can repeat upstream loss.
+		process_loss_qty += max(
+			(
+				flt(row.process_loss_qty)
+				if available_qty is None
+				else min(flt(row.process_loss_qty), max(available_qty - flt(row.completed_qty), 0))
+			)
+			for row in rows
+		)
+		available_qty = min(flt(row.completed_qty) for row in rows)
+
+	return flt(process_loss_qty)
+
+
+def get_operation_target_qty(work_order, operation):
+	"""Operation qty less the process loss booked before it."""
+	return flt(
+		get_operation_qty(work_order, operation) - get_upstream_process_loss(work_order, operation),
+		operation.precision("completed_qty"),
+	)
 
 
 def split_qty_based_on_batch_size(wo_doc, row, qty):
 	if not cint(frappe.db.get_value("Operation", row.operation, "create_job_card_based_on_batch_size")):
-		row.batch_size = row.get("qty") or wo_doc.qty
+		row.batch_size = row.get("qty") or get_operation_qty(wo_doc, row)
 
 	row.job_card_qty = row.batch_size
 	if row.batch_size and qty >= row.batch_size:
@@ -424,23 +574,25 @@ def get_serial_nos_for_job_card(row, wo_doc):
 	):
 		used_serial_nos.extend(get_serial_nos(d.serial_no))
 
+	used_serial_nos = [
+		d.serial_no
+		for d in SerialBatchIdentity("Serial No").get_records(
+			wo_doc.production_item, used_serial_nos, ["serial_no"]
+		)
+	]
 	serial_nos = sorted(list(set(serial_nos) - set(used_serial_nos)))
 	row.serial_no = "\n".join(serial_nos[0 : cint(row.job_card_qty)])
 
 
 def get_serial_nos_for_work_order(work_order, production_item):
-	serial_nos = []
-	for d in frappe.get_all(
+	return frappe.get_all(
 		"Serial No",
-		fields=["name"],
 		filters={
 			"work_order": work_order,
 			"item_code": production_item,
 		},
-	):
-		serial_nos.append(d.name)
-
-	return serial_nos
+		pluck="serial_no",
+	)
 
 
 def validate_operation_data(row):
@@ -509,14 +661,17 @@ def _job_card_core_values(work_order, row, qty):
 
 
 def _job_card_warehouse_values(work_order, row, qty):
-	if not work_order.skip_transfer or work_order.from_wip_warehouse:
+	moves_material = not work_order.skip_transfer or work_order.from_wip_warehouse
+	if work_order.track_semi_finished_goods and moves_material and row.get("wip_warehouse"):
+		wip_warehouse = row.get("wip_warehouse")
+	elif not work_order.skip_transfer or work_order.from_wip_warehouse:
 		wip_warehouse = work_order.wip_warehouse or row.get("wip_warehouse")
 	else:
 		wip_warehouse = work_order.source_warehouse or row.get("source_warehouse")
 
 	return {
 		"serial_no": row.get("serial_no"),
-		"time_required": (row.get("time_in_mins", 0) / work_order.qty) * qty,
+		"time_required": (row.get("time_in_mins", 0) / get_operation_qty(work_order, row)) * qty,
 		"source_warehouse": row.get("source_warehouse") or work_order.get("source_warehouse"),
 		"target_warehouse": row.get("fg_warehouse") or work_order.get("fg_warehouse"),
 		"wip_warehouse": wip_warehouse,
@@ -580,7 +735,8 @@ def create_pick_list(
 	_validate_material_is_pending(doc.locations)
 	doc.purpose = "Material Transfer for Manufacture"
 	doc.for_qty = for_qty
-	doc.set_item_locations()
+	if not doc.pick_manually:
+		doc.set_item_locations()
 	return doc
 
 
@@ -598,21 +754,31 @@ def _pick_list_mapping(postprocess, allocation):
 
 def _allocate_material_demand(work_order, fraction):
 	"""Fraction of each (item, warehouse, operation row) group's requirement, capped
-	at the group's proportional share of the item's pending pool."""
+	at the group's proportional share of the item's pending pool. Whole number UOMs
+	round up, within the item's rounded up total and its unrounded pending qty."""
 	required_by_item = {}
 	covered_by_item = {}
 	required_by_group = {}
+	uom_by_item = {}
 	for row in work_order.required_items:
 		required_by_item[row.item_code] = required_by_item.get(row.item_code, 0.0) + flt(row.required_qty)
-		covered_by_item.setdefault(
-			row.item_code,
-			flt(row.transferred_qty) + flt(row.requested_qty) + flt(row.picked_qty),
-		)
+		uom_by_item.setdefault(row.item_code, row.stock_uom)
+		covered_by_item.setdefault(row.item_code, flt(row.requested_qty) + flt(row.picked_qty))
+		covered_by_item[row.item_code] += flt(row.transferred_qty)
 		key = _allocation_key(row)
 		required_by_group[key] = required_by_group.get(key, 0.0) + flt(row.required_qty)
 
+	precision = frappe.get_precision("Work Order Item", "required_qty")
 	pending_pool = {
-		item_code: required_qty - covered_by_item[item_code]
+		item_code: flt(required_qty - covered_by_item[item_code], precision)
+		for item_code, required_qty in required_by_item.items()
+	}
+
+	remaining_by_item = {
+		item_code: min(
+			_round_demand(required_qty * fraction, uom_by_item[item_code], precision),
+			pending_pool[item_code],
+		)
 		for item_code, required_qty in required_by_item.items()
 	}
 
@@ -623,10 +789,20 @@ def _allocate_material_demand(work_order, fraction):
 			continue
 
 		pool_share = pending_pool[item_code] * required_qty / required_by_item[item_code]
-		qty = min(required_qty * fraction, pool_share)
+		qty = _round_demand(min(required_qty * fraction, pool_share), uom_by_item[item_code], precision)
+		qty = min(qty, remaining_by_item[item_code])
 		if qty > 0:
 			allocation[key] = qty
+			remaining_by_item[item_code] -= qty
 	return allocation
+
+
+def _round_demand(qty, stock_uom, precision):
+	"""Whole number UOMs round up even a demand below field precision. Rounding to 9
+	decimals first keeps float noise (30 * 0.1) from adding a unit."""
+	if cint(frappe.get_cached_value("UOM", stock_uom, "must_be_whole_number")):
+		return math.ceil(flt(qty, 9))
+	return flt(qty, precision)
 
 
 def _allocation_key(row):
@@ -740,12 +916,13 @@ def make_stock_return_entry(work_order: str):
 
 	frappe.has_permission("Stock Entry", "create", throw=True)
 
-	wo_doc = frappe.get_cached_doc("Work Order", work_order)
+	wo_doc = frappe.get_doc("Work Order", work_order, check_permission="read")
 
 	stock_entry = frappe.new_doc("Stock Entry")
 	stock_entry.from_bom = 1
 	stock_entry.is_return = 1
 	stock_entry.work_order = work_order
+	stock_entry.company = wo_doc.company
 	stock_entry.purpose = "Material Transfer for Manufacture"
 	stock_entry.bom_no = wo_doc.bom_no
 	stock_entry.set_stock_entry_type()

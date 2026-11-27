@@ -32,7 +32,7 @@ frappe.ui.form.on("Journal Entry", {
 			erpnext.journal_entry.lock_reversal_entry(frm);
 		}
 
-		erpnext.toggle_naming_series();
+		erpnext.toggle_naming_series(frm);
 		erpnext.journal_entry.add_custom_buttons(frm);
 		erpnext.journal_entry.toggle_fields_based_on_currency(frm);
 		erpnext.accounts.unreconcile_payment.add_unreconcile_btn(frm);
@@ -205,6 +205,7 @@ frappe.ui.form.on("Journal Entry Account", {
 					row.account = d.account;
 					row.party = d.party;
 					row.party_type = d.party_type;
+					row.account_currency = d.account_currency;
 					row.exchange_rate = d.exchange_rate;
 				}
 			});
@@ -247,6 +248,11 @@ Object.assign(erpnext.journal_entry, {
 				() => erpnext.journal_entry.show_general_ledger(frm),
 				__("View")
 			);
+		}
+
+		if ((frm.doc.accounts || []).some((row) => ["Receivable", "Payable"].includes(row.account_type))) {
+			erpnext.accounts.show_payment_ledger(frm);
+			erpnext.accounts.ledger_preview.show_payment_ledger_preview(frm);
 		}
 
 		if (frm.doc.docstatus == 1 && !frm.doc.reversal_of) {
@@ -375,8 +381,8 @@ Object.assign(erpnext.journal_entry, {
 			],
 		});
 
-		dialog.set_primary_action(__("Save"), () => {
-			erpnext.journal_entry.save_quick_entry(frm, dialog.get_values());
+		dialog.set_primary_action(__("Save"), (values) => {
+			erpnext.journal_entry.save_quick_entry(frm, values);
 			dialog.hide();
 		});
 		dialog.show();
@@ -443,6 +449,7 @@ Object.assign(erpnext.journal_entry, {
 		if (!frm.doc.company) frappe.throw(__("Please select Company first"));
 		if (!frm.doc.posting_date) frappe.throw(__("Please select Posting Date first"));
 
+		const { account_currency, exchange_rate } = row;
 		return frappe.call({
 			method: "erpnext.accounts.doctype.journal_entry.journal_entry.get_account_details_and_party_type",
 			args: {
@@ -451,10 +458,13 @@ Object.assign(erpnext.journal_entry, {
 				company: frm.doc.company,
 				debit: flt(row.debit_in_account_currency),
 				credit: flt(row.credit_in_account_currency),
-				exchange_rate: row.exchange_rate,
 			},
 			callback: ({ message }) => {
 				if (!message) return;
+				// keep a set rate only while the currency stays the same
+				if (message.account_currency == account_currency && ![0, 1].includes(flt(exchange_rate))) {
+					message.exchange_rate = exchange_rate;
+				}
 				$.extend(row, message);
 				erpnext.journal_entry.set_amount_on_last_row(frm, cdt, cdn);
 				erpnext.journal_entry.set_debit_credit_in_company_currency(frm, cdt, cdn);
@@ -631,6 +641,9 @@ Object.assign(erpnext.journal_entry, {
 	},
 
 	set_debit_credit_in_company_currency(frm, cdt, cdn) {
+		// Exchange gain/loss journals adjust base and account currency amounts independently.
+		if (frm.doc.voucher_type === "Exchange Gain Or Loss" && frm.doc.multi_currency) return;
+
 		const row = frappe.get_doc(cdt, cdn);
 		frappe.model.set_value(
 			cdt,

@@ -9,6 +9,9 @@ import frappe
 from frappe import _
 from frappe.utils import add_to_date, cint, flt, get_datetime, getdate
 
+from erpnext.manufacturing.doctype.manufacturing_settings.manufacturing_settings import (
+	get_capacity_planning_days,
+)
 from erpnext.manufacturing.scheduling import loaders
 from erpnext.manufacturing.scheduling.engine import SchedulingEngine
 from erpnext.manufacturing.scheduling.models import Task
@@ -108,8 +111,8 @@ def run_engine(plan, start_date, use_item_dates=0, item_dates=None):
 	engine = SchedulingEngine(
 		resources,
 		existing_load=load,
-		gap_mins=cint(settings.mins_between_operations) or 10,
-		horizon_days=cint(settings.capacity_planning_for_days) or 365,
+		gap_mins=cint(settings.mins_between_operations),
+		horizon_days=get_capacity_planning_days(),
 	)
 
 	result = engine.schedule(tasks, anchor=start_date)
@@ -175,17 +178,20 @@ def get_supplier_lead_times(item_codes):
 	if not item_codes:
 		return {}
 
+	lead_time = frappe.qb.DocType("Item Lead Time")
 	table = frappe.qb.DocType("Item Lead Time Supplier")
 	rows = (
 		frappe.qb.from_(table)
-		.select(table.parent, table.supplier, table.purchase_time, table.buffer_time, table.is_default)
-		.where(table.parent.isin(list(item_codes)) & (table.parenttype == "Item Lead Time"))
+		.join(lead_time)
+		.on(lead_time.name == table.parent)
+		.select(lead_time.item_code, table.supplier, table.purchase_time, table.buffer_time, table.is_default)
+		.where(lead_time.item_code.isin(list(item_codes)) & (table.parenttype == "Item Lead Time"))
 		.run(as_dict=True)
 	)
 
 	grouped = defaultdict(dict)
 	for row in rows:
-		grouped[row.parent][row.supplier] = row
+		grouped[row.item_code][row.supplier] = row
 	return dict(grouped)
 
 
@@ -454,9 +460,6 @@ def get_daily_working_mins(lead_time, no_of_shifts):
 
 def get_daily_capacity(lead_time, no_of_shifts):
 	capacity = flt(lead_time.capacity_per_day)
-	if capacity and lead_time.daily_yield:
-		capacity = capacity * flt(lead_time.daily_yield) / 100
-
 	if capacity and no_of_shifts:
 		capacity = capacity * no_of_shifts / (cint(lead_time.no_of_shift) or 1)
 

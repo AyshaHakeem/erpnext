@@ -34,6 +34,7 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 		doc = self.doc
 		warehouse_with_no_account = []
 
+		remarks = doc.get("remarks") or _("Accounting Entry for Stock")
 		supplied_items_details = frappe._dict()
 		for item in doc.supplied_items:
 			supplied_items_details.setdefault(item.reference_name, []).append(
@@ -47,6 +48,7 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 				)
 			)
 
+		received_qty_ratios = doc.get_received_qty_ratios_for_return(doc.get_rejected_return_rows())
 		for item in doc.items:
 			if flt(item.rate) and flt(item.qty):
 				_inv_dict = doc.get_inventory_account_dict(item, inventory_account_map)
@@ -64,8 +66,6 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 						"stock_value_difference",
 					)
 
-					remarks = doc.get("remarks") or _("Accounting Entry for Stock")
-
 					self.add_gl_entry(
 						gl_entries=gl_entries,
 						account=_inv_dict["account"],
@@ -79,9 +79,13 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 						item=item,
 					)
 
-					service_cost = flt(
-						item.service_cost_per_qty, item.precision("service_cost_per_qty")
-					) * flt(item.qty, item.precision("qty"))
+					# the stock value holds the service cost of rejected and lost units too
+					if item.name in received_qty_ratios:
+						service_qty = flt(item.qty) * received_qty_ratios[item.name]
+					else:
+						service_qty = doc.get_qty_for_costing(item)
+
+					service_cost = flt(flt(item.service_cost_per_qty) * service_qty, item.precision("amount"))
 
 					self.add_gl_entry(
 						gl_entries=gl_entries,
@@ -110,60 +114,18 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 						item=item,
 					)
 
-					if flt(item.rm_supp_cost):
-						for rm_item in supplied_items_details.get(item.name):
-							_inv_dict = doc.get_inventory_account_dict(
-								rm_item, inventory_account_map, "supplier_warehouse"
-							)
-
-							self.add_gl_entry(
-								gl_entries=gl_entries,
-								account=_inv_dict.get("account"),
-								cost_center=rm_item.cost_center or item.cost_center,
-								debit=0.0,
-								credit=flt(rm_item.amount),
-								remarks=remarks,
-								against_account=rm_item.expense_account or item.expense_account,
-								account_currency=_inv_dict.get("account_currency"),
-								project=item.project,
-								item=item,
-							)
-							self.add_gl_entry(
-								gl_entries=gl_entries,
-								account=rm_item.expense_account or item.expense_account,
-								cost_center=rm_item.cost_center or item.cost_center,
-								debit=flt(rm_item.amount),
-								credit=0.0,
-								remarks=remarks,
-								against_account=_inv_dict.get("account"),
-								account_currency=get_account_currency(item.expense_account),
-								project=item.project,
-								item=item,
-							)
-
-					if item.additional_cost_per_qty:
-						self.add_gl_entry(
-							gl_entries=gl_entries,
-							account=item.expense_account,
-							cost_center=doc.cost_center or doc.get_company_default("cost_center"),
-							debit=item.qty * item.additional_cost_per_qty,
-							credit=0.0,
-							remarks=remarks,
-							against_account=None,
-							account_currency=get_account_currency(item.expense_account),
-						)
-
 					if divisional_loss := flt(item.amount - stock_value_diff, item.precision("amount")):
 						loss_account = doc.get_company_default(
 							"stock_adjustment_account", ignore_validation=True
 						)
 
+						# the receipt amount the ledger did not take into stock is a loss
 						self.add_gl_entry(
 							gl_entries=gl_entries,
 							account=loss_account,
 							cost_center=item.cost_center,
-							debit=0.0,
-							credit=divisional_loss,
+							debit=divisional_loss,
+							credit=0.0,
 							remarks=remarks,
 							against_account=item.expense_account,
 							account_currency=get_account_currency(loss_account),
@@ -174,8 +136,8 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 							gl_entries=gl_entries,
 							account=item.expense_account,
 							cost_center=item.cost_center,
-							debit=divisional_loss,
-							credit=0.0,
+							debit=0.0,
+							credit=divisional_loss,
 							remarks=remarks,
 							against_account=loss_account,
 							account_currency=get_account_currency(item.expense_account),
@@ -187,6 +149,22 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 					or item.rejected_warehouse not in warehouse_with_no_account
 				):
 					warehouse_with_no_account.append(item.warehouse)
+
+			self._make_supplied_items_gl_entries(
+				gl_entries, item, supplied_items_details.get(item.name, []), inventory_account_map, remarks
+			)
+
+			if item.additional_cost_per_qty:
+				self.add_gl_entry(
+					gl_entries=gl_entries,
+					account=item.expense_account,
+					cost_center=doc.cost_center or doc.get_company_default("cost_center"),
+					debit=flt(item.received_qty) * item.additional_cost_per_qty,
+					credit=0.0,
+					remarks=remarks,
+					against_account=None,
+					account_currency=get_account_currency(item.expense_account),
+				)
 
 		for row in doc.additional_costs:
 			credit_amount = (
@@ -211,6 +189,44 @@ class SubcontractingReceiptGLComposer(BaseStockGLComposer):
 				_("No accounting entries for the following warehouses")
 				+ ": \n"
 				+ "\n".join(warehouse_with_no_account)
+			)
+
+	def _make_supplied_items_gl_entries(
+		self, gl_entries: list, item, supplied_items: list, inventory_account_map: dict | None, remarks: str
+	) -> None:
+		"""Credit the supplier warehouse for consumed raw materials, also when the row has no accepted qty."""
+		for rm_item in supplied_items:
+			if not flt(rm_item.amount):
+				continue
+
+			_inv_dict = self.doc.get_inventory_account_dict(
+				rm_item, inventory_account_map, "supplier_warehouse"
+			)
+			expense_account = rm_item.expense_account or item.expense_account
+
+			self.add_gl_entry(
+				gl_entries=gl_entries,
+				account=_inv_dict.get("account"),
+				cost_center=rm_item.cost_center or item.cost_center,
+				debit=0.0,
+				credit=flt(rm_item.amount),
+				remarks=remarks,
+				against_account=expense_account,
+				account_currency=_inv_dict.get("account_currency"),
+				project=item.project,
+				item=item,
+			)
+			self.add_gl_entry(
+				gl_entries=gl_entries,
+				account=expense_account,
+				cost_center=rm_item.cost_center or item.cost_center,
+				debit=flt(rm_item.amount),
+				credit=0.0,
+				remarks=remarks,
+				against_account=_inv_dict.get("account"),
+				account_currency=get_account_currency(item.expense_account),
+				project=item.project,
+				item=item,
 			)
 
 	def _make_item_gl_entries_for_lcv(self, gl_entries: list, inventory_account_map: dict | None) -> None:

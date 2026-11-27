@@ -121,6 +121,27 @@ frappe.ui.form.on("BOM", {
 				title: __("Mandatory"),
 			});
 		}
+
+		frm.events.set_default_last_step(frm);
+	},
+
+	set_default_last_step(frm) {
+		const steps = frm.doc.operations || [];
+		if (!frm.doc.track_semi_finished_goods || !steps.length) return;
+
+		if (!steps.some((row) => row.is_final_finished_good)) {
+			const makes_bom_item = steps.filter((row) => row.finished_good === frm.doc.item);
+			const last_step = steps[steps.length - 1];
+			if (makes_bom_item.length === 1) {
+				makes_bom_item[0].is_final_finished_good = 1;
+			} else if (!makes_bom_item.length && !last_step.finished_good) {
+				last_step.is_final_finished_good = 1;
+			}
+		}
+
+		steps
+			.filter((row) => row.is_final_finished_good && !row.finished_good)
+			.forEach((row) => (row.finished_good = frm.doc.item));
 	},
 
 	set_company_filters: function (frm, fieldname) {
@@ -170,6 +191,66 @@ frappe.ui.form.on("BOM", {
 		});
 
 		frm.fields_dict["operations"].grid.reset_grid();
+		frm.events.render_stage_summary(frm);
+	},
+
+	render_stage_summary(frm) {
+		const wrapper = frm.get_field("stage_summary")?.$wrapper;
+		if (!wrapper) return;
+
+		wrapper.empty();
+		if (!frm.doc.track_semi_finished_goods || !frm.doc.operations?.length) return;
+
+		const can_add = !frm.is_new() && frm.doc.docstatus === 0;
+		const rows = frm.doc.operations.map((row) => frm.events.get_stage_summary_row(frm, row, can_add));
+
+		wrapper.html(`
+			<div style="border:1px solid var(--border-color);border-radius:var(--border-radius-md);margin-bottom:var(--margin-lg);">
+				${rows.join("")}
+			</div>`);
+
+		wrapper.find(".stage-add-materials").on("click", (event) => {
+			const row = frm.doc.operations.find((d) => d.name === $(event.currentTarget).attr("data-row"));
+			frm.events._prompt_for_raw_materials(frm, row);
+		});
+	},
+
+	get_stage_summary_row(frm, row, can_add) {
+		const escape = frappe.utils.escape_html;
+		const count = (frm.doc.items || []).filter(
+			(item) => item.item_code && cint(item.operation_row_id) === cint(row.idx)
+		).length;
+
+		let [color, status] = ["red", __("No raw materials")];
+		if (count) {
+			[color, status] = [
+				"green",
+				count === 1 ? __("1 raw material") : __("{0} raw materials", [count]),
+			];
+		} else if (row.bom_no) {
+			[color, status] = ["blue", __("From BOM")];
+		}
+
+		const makes = row.finished_good ? escape(row.finished_good) : __("Output Item not set");
+		const last = row.is_final_finished_good
+			? ` <span class="text-muted">(${__("Last Step")})</span>`
+			: "";
+		const add_button =
+			can_add && !count && !row.bom_no
+				? `<button class="btn btn-xs btn-default stage-add-materials" data-row="${row.name}">${__(
+						"Add Raw Materials"
+				  )}</button>`
+				: "";
+
+		const border =
+			row.idx < frm.doc.operations.length ? "border-bottom:1px solid var(--border-color);" : "";
+
+		return `<div style="display:flex;align-items:center;gap:12px;height:40px;padding:0 12px;${border}">
+			<span class="ellipsis" style="flex:2;">${row.idx}. ${escape(row.operation || "")}</span>
+			<span class="ellipsis" style="flex:3;">${__("Makes")} ${makes}${last}</span>
+			<span style="flex:2;"><span class="indicator-pill no-indicator-dot ${color}">${status}</span></span>
+			<span style="flex:0 0 140px;text-align:right;white-space:nowrap;">${add_button}</span>
+		</div>`;
 	},
 
 	toggle_percentage_field(frm) {
@@ -183,6 +264,21 @@ frappe.ui.form.on("BOM", {
 
 	set_qty_based_on_percentage(frm) {
 		frm.trigger("toggle_percentage_field");
+		if (frm.doc.set_qty_based_on_percentage) {
+			erpnext.bom.set_qty_from_percentage(frm);
+		} else {
+			frm.set_df_property("items", "description", "");
+		}
+	},
+
+	quantity(frm) {
+		erpnext.bom.set_qty_from_percentage(frm);
+		erpnext.bom.calculate_op_cost(frm.doc);
+		erpnext.bom.calculate_total(frm.doc);
+	},
+
+	uom(frm) {
+		erpnext.bom.set_qty_from_percentage(frm);
 	},
 
 	with_operations: function (frm) {
@@ -195,6 +291,27 @@ frappe.ui.form.on("BOM", {
 
 	fg_based_operating_cost: function (frm) {
 		frm.set_df_property("with_operations", "hidden", frm.doc.fg_based_operating_cost ? 1 : 0);
+	},
+
+	toggle_with_operations(frm) {
+		if (cint(frappe.boot.sysdefaults.enable_operations_and_job_cards)) {
+			return;
+		}
+
+		frm.toggle_enable("with_operations", frm.doc.with_operations);
+		frm.set_df_property(
+			"with_operations",
+			"description",
+			__("To use operations, enable {0} in {1}.", [
+				`<b>${__("Enable Operations & Job Cards")}</b>`,
+				frappe.utils.get_form_link(
+					"Manufacturing Settings",
+					"Manufacturing Settings",
+					true,
+					__("Manufacturing Settings")
+				),
+			])
+		);
 	},
 
 	onload_post_render: function (frm) {
@@ -215,16 +332,21 @@ frappe.ui.form.on("BOM", {
 	},
 
 	default_target_warehouse(frm) {
-		if (frm.doc.default_source_warehouse) {
-			frm.doc.operations.forEach((d) => {
-				frappe.model.set_value(d.doctype, d.name, "fg_warehouse", frm.doc.default_target_warehouse);
-			});
-		}
+		frm.doc.operations.forEach((d) => {
+			frappe.model.set_value(d.doctype, d.name, "fg_warehouse", frm.doc.default_target_warehouse);
+		});
+		// Valuation Rate secondary items are valued in this warehouse
+		frm.doc.secondary_items.forEach((d) => {
+			if (d.valuation_type === "Valuation Rate") {
+				erpnext.bom.fetch_secondary_item_cost(frm.doc, d.doctype, d.name);
+			}
+		});
 	},
 
 	refresh(frm) {
 		frm.toggle_enable("item", frm.doc.__islocal);
 
+		frm.trigger("toggle_with_operations");
 		frm.trigger("toggle_fields_for_semi_finished_goods");
 		frm.trigger("toggle_percentage_field");
 
@@ -515,6 +637,14 @@ frappe.ui.form.on("BOM", {
 						reqd: 1,
 					},
 					{
+						fieldname: "uom",
+						label: __("UOM"),
+						fieldtype: "Link",
+						options: "UOM",
+						in_list_view: 1,
+						read_only: 1,
+					},
+					{
 						fieldname: "source_warehouse",
 						label: __("Source Warehouse"),
 						fieldtype: "Link",
@@ -561,6 +691,7 @@ frappe.ui.form.on("BOM", {
 				item_code: d.item_code,
 				variant_item_code: "",
 				qty: flt(d.qty / frm.doc.quantity) * flt(bom_qty),
+				uom: d.uom,
 				source_warehouse: d.source_warehouse,
 				operation: d.operation,
 			});
@@ -651,24 +782,42 @@ frappe.ui.form.on("BOM Operation", {
 		);
 	},
 
-	bom_no(frm, cdt, cdn) {
-		let row = locals[cdt][cdn];
+	is_final_finished_good(frm) {
+		frm.events.render_stage_summary(frm);
+	},
 
-		if (row.bom_no && row.finished_good) {
-			frappe.call({
-				method: "add_materials_from_bom",
-				doc: frm.doc,
-				args: {
-					finished_good: row.finished_good,
-					bom_no: row.bom_no,
-					operation_row_id: row.idx,
-					qty: row.finished_good_qty,
-				},
-				callback(r) {
-					refresh_field("items");
-				},
-			});
+	operations_add(frm) {
+		frm.events.render_stage_summary(frm);
+	},
+
+	operations_remove(frm) {
+		frm.events.render_stage_summary(frm);
+	},
+
+	async bom_no(frm, cdt, cdn) {
+		let row = locals[cdt][cdn];
+		if (!row.bom_no) return;
+
+		if (!row.finished_good) {
+			const { message } = await frappe.db.get_value("BOM", row.bom_no, "item");
+			await frappe.model.set_value(cdt, cdn, "finished_good", message?.item);
 		}
+
+		frappe.call({
+			method: "add_materials_from_bom",
+			doc: frm.doc,
+			args: {
+				finished_good: row.finished_good,
+				bom_no: row.bom_no,
+				operation_row_id: row.idx,
+				qty: row.finished_good_qty,
+				replace: 1,
+			},
+			callback() {
+				refresh_field("items");
+				frm.events.render_stage_summary(frm);
+			},
+		});
 	},
 });
 
@@ -728,24 +877,59 @@ erpnext.bom.BomController = class BomController extends erpnext.TransactionContr
 			this.frm.events.update_cost(this.frm);
 		}
 	}
+
+	hour_rate(doc) {
+		erpnext.bom.calculate_op_cost(doc);
+		erpnext.bom.calculate_total(doc);
+	}
+
+	time_in_mins(doc) {
+		this.hour_rate(doc);
+	}
+
+	batch_size(doc) {
+		this.hour_rate(doc);
+	}
+
+	set_cost_based_on_bom_qty(doc) {
+		this.hour_rate(doc);
+	}
+
+	fixed_time(doc) {
+		this.hour_rate(doc);
+	}
+
+	bom_no(doc, cdt, cdn) {
+		get_bom_material_detail(doc, cdt, cdn, false);
+	}
+
+	is_default(doc) {
+		if (doc.is_default) this.frm.set_value("is_active", 1);
+	}
+
+	qty(doc) {
+		erpnext.bom.calculate_rm_cost(doc);
+		erpnext.bom.calculate_total(doc);
+	}
+
+	rate(doc, cdt, cdn) {
+		let d = locals[cdt][cdn];
+
+		if (d.bom_no) {
+			frappe.msgprint(__("You cannot change the rate if BOM is mentioned against any Item."));
+			get_bom_material_detail(doc, cdt, cdn, false);
+		} else {
+			erpnext.bom.calculate_rm_cost(doc);
+			erpnext.bom.calculate_total(doc);
+		}
+	}
+
+	validate(doc) {
+		erpnext.bom.update_cost(doc);
+	}
 };
 
-extend_cscript(cur_frm.cscript, new erpnext.bom.BomController({ frm: cur_frm }));
-
-cur_frm.cscript.hour_rate = function (doc) {
-	erpnext.bom.calculate_op_cost(doc);
-	erpnext.bom.calculate_total(doc);
-};
-
-cur_frm.cscript.time_in_mins = cur_frm.cscript.hour_rate;
-
-cur_frm.cscript.bom_no = function (doc, cdt, cdn) {
-	get_bom_material_detail(doc, cdt, cdn, false);
-};
-
-cur_frm.cscript.is_default = function (doc) {
-	if (doc.is_default) cur_frm.set_value("is_active", 1);
-};
+frappe.ui.form.set_controller("BOM", erpnext.bom.BomController);
 
 var get_bom_material_detail = function (doc, cdt, cdn, secondary_items) {
 	if (!doc.company) {
@@ -769,6 +953,7 @@ var get_bom_material_detail = function (doc, cdt, cdn, secondary_items) {
 				conversion_factor: d.conversion_factor,
 				sourced_by_supplier: d.sourced_by_supplier,
 				do_not_explode: d.do_not_explode,
+				set_rate_of_sub_assembly_item_based_on_bom: d.set_rate_of_sub_assembly_item_based_on_bom,
 				source_warehouse: d.source_warehouse || doc.default_source_warehouse,
 				fetch_rate: !secondary_items,
 			},
@@ -790,23 +975,6 @@ var get_bom_material_detail = function (doc, cdt, cdn, secondary_items) {
 	}
 };
 
-cur_frm.cscript.qty = function (doc) {
-	erpnext.bom.calculate_rm_cost(doc);
-	erpnext.bom.calculate_total(doc);
-};
-
-cur_frm.cscript.rate = function (doc, cdt, cdn) {
-	var d = locals[cdt][cdn];
-
-	if (d.bom_no) {
-		frappe.msgprint(__("You cannot change the rate if BOM is mentioned against any Item."));
-		get_bom_material_detail(doc, cdt, cdn, false);
-	} else {
-		erpnext.bom.calculate_rm_cost(doc);
-		erpnext.bom.calculate_total(doc);
-	}
-};
-
 erpnext.bom.update_cost = function (doc) {
 	erpnext.bom.calculate_op_cost(doc);
 	erpnext.bom.calculate_rm_cost(doc);
@@ -819,13 +987,23 @@ erpnext.bom.calculate_op_cost = function (doc) {
 
 	if (doc.with_operations) {
 		doc.operations.forEach((item) => {
-			let operating_cost = flt((flt(item.hour_rate) * flt(item.time_in_mins)) / 60, 2);
-			let base_operating_cost = flt(operating_cost * doc.conversion_rate, 2);
+			let operating_cost = (flt(item.hour_rate) * flt(item.time_in_mins)) / 60;
+			let base_operating_cost = operating_cost * flt(doc.conversion_rate);
+			let cost_per_unit = operating_cost / (flt(item.batch_size) || 1);
+			let base_cost_per_unit = base_operating_cost / (flt(item.batch_size) || 1);
 			frappe.model.set_value("BOM Operation", item.name, {
-				operating_cost: operating_cost,
-				base_operating_cost: base_operating_cost,
+				operating_cost: flt(operating_cost, precision("operating_cost", item)),
+				base_operating_cost: flt(base_operating_cost, precision("base_operating_cost", item)),
+				cost_per_unit: cost_per_unit,
+				base_cost_per_unit: base_cost_per_unit,
 			});
 
+			// as is_costed_per_batch in services/costing.py
+			const batch_based = doc.__onload?.batch_based_operations?.includes(item.operation);
+			if (!item.fixed_time && (item.set_cost_based_on_bom_qty || batch_based)) {
+				operating_cost = cost_per_unit * flt(doc.quantity);
+				base_operating_cost = base_cost_per_unit * flt(doc.quantity);
+			}
 			doc.operating_cost += operating_cost;
 			doc.base_operating_cost += base_operating_cost;
 		});
@@ -864,22 +1042,45 @@ erpnext.bom.calculate_rm_cost = function (doc) {
 		total_rm_cost += amount;
 		base_total_rm_cost += base_amount;
 	}
-	cur_frm.set_value("raw_material_cost", total_rm_cost);
-	cur_frm.set_value("base_raw_material_cost", base_total_rm_cost);
+	frappe.model.set_value(doc.doctype, doc.name, "raw_material_cost", total_rm_cost);
+	frappe.model.set_value(doc.doctype, doc.name, "base_raw_material_cost", base_total_rm_cost);
+};
+
+// Valuation Rate and Manual rows keep their cost; % of Component Cost rows split the rest
+erpnext.bom.calculate_secondary_items_cost = function (doc) {
+	const rows = doc.secondary_items || [];
+	const cost_precision = precision("raw_material_cost", doc);
+	const has_own_cost = (row) => ["Valuation Rate", "Manual"].includes(row.valuation_type);
+	const own_cost = rows
+		.filter(has_own_cost)
+		.reduce((total, row) => total + flt(row.cost, cost_precision), 0);
+	const allocation_basis = flt(doc.raw_material_cost) - own_cost;
+
+	let total = 0;
+	let base_total = 0;
+	rows.forEach((row) => {
+		row.cost = has_own_cost(row)
+			? flt(row.cost, cost_precision)
+			: flt((allocation_basis * flt(row.cost_allocation_per)) / 100, cost_precision);
+		row.base_cost = flt(row.cost * flt(doc.conversion_rate), cost_precision);
+		total += row.cost;
+		base_total += row.base_cost;
+	});
+
+	doc.secondary_items_cost = total;
+	doc.base_secondary_items_cost = base_total;
+	refresh_field(["secondary_items", "secondary_items_cost", "base_secondary_items_cost"]);
 };
 
 // Calculate Total Cost
 erpnext.bom.calculate_total = function (doc) {
+	erpnext.bom.calculate_secondary_items_cost(doc);
 	var total_cost = flt(doc.operating_cost) + flt(doc.raw_material_cost) - flt(doc.secondary_items_cost);
 	var base_total_cost =
 		flt(doc.base_operating_cost) + flt(doc.base_raw_material_cost) - flt(doc.base_secondary_items_cost);
 
-	cur_frm.set_value("total_cost", total_cost);
-	cur_frm.set_value("base_total_cost", base_total_cost);
-};
-
-cur_frm.cscript.validate = function (doc) {
-	erpnext.bom.update_cost(doc);
+	frappe.model.set_value(doc.doctype, doc.name, "total_cost", total_cost);
+	frappe.model.set_value(doc.doctype, doc.name, "base_total_cost", base_total_cost);
 };
 
 frappe.ui.form.on("BOM Operation", "operation", function (frm, cdt, cdn) {
@@ -959,12 +1160,158 @@ frappe.ui.form.on("BOM Operation", "workstation_type", function (frm, cdt, cdn) 
 	});
 });
 
+// Live preview of the percentage-based quantities. Mirrors BOM.set_qty_from_percentage on the
+// server, which stays the source of truth and re-runs on save; this only fills in the derived
+// values as the user types so they don't have to save to see them.
+erpnext.bom.set_qty_from_percentage = function (frm) {
+	if (!frm.doc.set_qty_based_on_percentage || frm._setting_qty_from_percentage) return;
+
+	const rows = frm.doc.items || [];
+	if (!rows.length) return;
+
+	frm._setting_qty_from_percentage = true;
+	try {
+		// A single Balance Item absorbs whatever percentage the other rows leave.
+		const balance_row = rows.find((row) => row.is_balance_item);
+		if (balance_row) {
+			const others_total = rows
+				.filter((row) => !row.is_balance_item)
+				.reduce((total, row) => total + flt(row.percentage), 0);
+			balance_row.percentage = Math.max(flt(100 - others_total), 0);
+			refresh_field("percentage", balance_row.name, balance_row.parentfield);
+		}
+
+		// qty = percentage / 100 * BOM quantity * UOM conversion factor. Set the derived values
+		// directly (like the stock_qty handler) and recompute cost once at the end -- routing each
+		// row through set_value would recalculate the whole raw-material cost on every row.
+		rows.forEach((row) => {
+			const factor = erpnext.bom.get_percentage_uom_factor(frm, row);
+			if (factor === undefined) return; // factor is being fetched; recompute in the callback
+			row.qty = flt(
+				(flt(row.percentage) / 100) * flt(frm.doc.quantity) * factor,
+				precision("qty", row)
+			);
+			row.stock_qty = flt(row.qty) * flt(row.conversion_factor) || flt(row.qty);
+			refresh_field("qty", row.name, row.parentfield);
+			refresh_field("stock_qty", row.name, row.parentfield);
+		});
+
+		erpnext.bom.calculate_rm_cost(frm.doc);
+		erpnext.bom.calculate_total(frm.doc);
+		erpnext.bom.show_percentage_total(frm, rows);
+	} finally {
+		frm._setting_qty_from_percentage = false;
+	}
+};
+
+// Conversion factor from the BOM's UOM to the component's UOM. 1 when they match; otherwise
+// fetched once from the server and cached on the form so typing stays responsive.
+erpnext.bom.get_percentage_uom_factor = function (frm, row) {
+	const from_uom = frm.doc.uom;
+	const to_uom = row.uom;
+	if (!from_uom || !to_uom || from_uom === to_uom) return 1;
+
+	frm._uom_factor_cache = frm._uom_factor_cache || {};
+	const key = `${from_uom}::${to_uom}`;
+	if (key in frm._uom_factor_cache) return frm._uom_factor_cache[key];
+
+	frm._uom_factor_cache[key] = undefined; // mark in-flight so we only fetch once
+	frappe.call({
+		method: "erpnext.stock.doctype.item.item.get_uom_conv_factor",
+		args: { uom: from_uom, stock_uom: to_uom },
+		callback(r) {
+			frm._uom_factor_cache[key] = flt(r.message);
+			erpnext.bom.set_qty_from_percentage(frm);
+		},
+		error() {
+			delete frm._uom_factor_cache[key]; // let the next edit retry the fetch
+		},
+	});
+	return undefined;
+};
+
+erpnext.bom.show_percentage_total = function (frm, rows) {
+	// Mirror the server's balance-item validation so the hint never shows a state that would be
+	// rejected on save (e.g. a Balance Item with no positive percentage left for it).
+	const balance_rows = rows.filter((row) => row.is_balance_item);
+	const non_balance_total = rows
+		.filter((row) => !row.is_balance_item)
+		.reduce((sum, row) => sum + flt(row.percentage), 0);
+
+	let message;
+	if (balance_rows.length > 1) {
+		message = __("Only one component can be marked as Balance Item.");
+	} else if (balance_rows.length === 1) {
+		message =
+			flt(100 - non_balance_total) > 0
+				? __("Components total 100%.")
+				: __(
+						"The other components already total {0}%, so no percentage remains for the Balance Item.",
+						[format_number(non_balance_total)]
+				  );
+	} else {
+		message =
+			Math.abs(non_balance_total - 100) <= 0.0001
+				? __("Components total 100%.")
+				: __("Components total {0}%. Mark a Balance Item or adjust the percentages to reach 100%.", [
+						format_number(non_balance_total),
+				  ]);
+	}
+	frm.set_df_property("items", "description", message);
+};
+
 frappe.ui.form.on("BOM Item", {
 	do_not_explode: function (frm, cdt, cdn) {
 		get_bom_material_detail(frm.doc, cdt, cdn, false);
 	},
 	source_warehouse: function (frm, cdt, cdn) {
 		get_bom_material_detail(frm.doc, cdt, cdn, false);
+	},
+	set_rate_of_sub_assembly_item_based_on_bom: function (frm, cdt, cdn) {
+		get_bom_material_detail(frm.doc, cdt, cdn, false);
+	},
+	percentage(frm) {
+		erpnext.bom.set_qty_from_percentage(frm);
+	},
+	is_balance_item(frm) {
+		erpnext.bom.set_qty_from_percentage(frm);
+	},
+	uom(frm, cdt, cdn) {
+		const row = locals[cdt][cdn];
+		if (!row.item_code || !row.uom) {
+			erpnext.bom.set_qty_from_percentage(frm);
+			return;
+		}
+		// The new UOM has its own conversion factor -- refresh it (and the rate/amount that depend
+		// on it) BEFORE deriving the percentage quantity, otherwise stock_qty would be computed from
+		// the previous UOM's factor and saved as a stale value.
+		const requested_item = row.item_code;
+		const requested_uom = row.uom;
+		frappe.call({
+			method: "erpnext.stock.get_item_details.get_conversion_factor",
+			args: { item_code: requested_item, uom: requested_uom },
+			callback(r) {
+				if (r.exc) return;
+				// Two quick UOM changes can resolve out of order; ignore a response whose row has
+				// since moved to a different item or UOM so a stale factor isn't applied.
+				const current = locals[cdt][cdn];
+				if (!current || current.item_code !== requested_item || current.uom !== requested_uom) {
+					return;
+				}
+				frappe.model
+					.set_value(cdt, cdn, "conversion_factor", flt(r.message.conversion_factor))
+					.then(() => {
+						// get_bom_material_detail echoes back the quantity it was sent, so its response
+						// overwrites the row's qty. Derive the percentage quantity AFTER that response is
+						// applied, otherwise the freshly computed qty would be reverted to the old one.
+						const refresh = get_bom_material_detail(frm.doc, cdt, cdn, false);
+						Promise.resolve(refresh).then(() => erpnext.bom.set_qty_from_percentage(frm));
+					});
+			},
+		});
+	},
+	items_add(frm) {
+		erpnext.bom.set_qty_from_percentage(frm);
 	},
 });
 
@@ -1008,6 +1355,8 @@ frappe.ui.form.on("BOM Operation", "operations_remove", function (frm) {
 frappe.ui.form.on("BOM Item", "items_remove", function (frm) {
 	erpnext.bom.calculate_rm_cost(frm.doc);
 	erpnext.bom.calculate_total(frm.doc);
+	erpnext.bom.set_qty_from_percentage(frm);
+	frm.events.render_stage_summary(frm);
 });
 
 frappe.tour["BOM"] = [
@@ -1049,33 +1398,57 @@ frappe.ui.form.on("BOM Secondary Item", {
 			frappe.model.set_value(cdt, cdn, { cost: 0, base_cost: 0 });
 		}
 	},
+	process_loss_per(frm, cdt, cdn) {
+		if (locals[cdt][cdn].valuation_type === "Valuation Rate") {
+			erpnext.bom.fetch_secondary_item_cost(frm.doc, cdt, cdn);
+		}
+	},
 });
 
 erpnext.bom.fetch_secondary_item_cost = function (doc, cdt, cdn) {
-	const row = locals[cdt][cdn];
-	if (!row.item_code) return;
+	const args = {
+		item_code: locals[cdt][cdn].item_code,
+		company: doc.company,
+		warehouse: doc.default_target_warehouse || "",
+	};
+	if (!args.item_code) return;
 
+	// not a doc method: its reply syncs back the row as sent, undoing later edits
 	frappe.call({
-		doc: doc,
-		method: "get_bom_material_detail",
-		args: {
-			company: doc.company,
-			item_code: row.item_code,
-			uom: row.uom,
-			stock_uom: row.stock_uom,
-			conversion_factor: row.conversion_factor,
-			warehouse: doc.default_target_warehouse,
-			set_rate_based_on_warehouse: 1,
-			force_valuation_rate: 1,
-			fetch_rate: 1,
-			bom_no: "",
-		},
+		method: "erpnext.manufacturing.doctype.bom.bom.get_secondary_item_valuation_rate",
+		args: args,
 		callback(r) {
-			const cost = flt(r.message.rate) * flt(row.stock_qty);
-			frappe.model.set_value(cdt, cdn, {
-				cost: cost,
-				base_cost: cost * flt(doc.conversion_rate || 1),
-			});
+			const row = locals[cdt][cdn];
+			doc = locals[doc.doctype][doc.name];
+			// the form may have been reloaded meanwhile
+			if (!doc || !row || row.valuation_type !== "Valuation Rate") return;
+
+			// the item, company or warehouse changed while the rate was being fetched
+			if (
+				row.item_code !== args.item_code ||
+				doc.company !== args.company ||
+				(doc.default_target_warehouse || "") !== args.warehouse
+			) {
+				erpnext.bom.fetch_secondary_item_cost(doc, cdt, cdn);
+				return;
+			}
+
+			const loss_qty = Math.min(
+				flt(
+					(flt(row.stock_qty) * flt(row.process_loss_per)) / 100,
+					precision("process_loss_qty", row)
+				),
+				flt(row.stock_qty)
+			);
+			const produced_qty = flt(row.stock_qty) - loss_qty;
+			const conversion_rate = flt(doc.conversion_rate || 1);
+			const cost = (flt(r.message) / conversion_rate) * produced_qty;
+			frappe.model
+				.set_value(cdt, cdn, {
+					cost: cost,
+					base_cost: cost * conversion_rate,
+				})
+				.then(() => erpnext.bom.calculate_total(doc));
 		},
 	});
 };
@@ -1116,8 +1489,7 @@ frappe.ui.form.on("BOM", {
 			title: __("Add Raw Materials"),
 			fields: fields,
 			primary_action_label: __("Add"),
-			primary_action: () => {
-				let values = frm._bom_rm_dialog.get_values();
+			primary_action: (values) => {
 				if (values) {
 					frm.events._add_raw_materials(frm, values);
 					frm._bom_rm_dialog.hide();
@@ -1190,6 +1562,6 @@ frappe.ui.form.on("BOM", {
 				operation_row_id: values.operation_row_id,
 				items: values.items,
 			},
-		});
+		}).then(() => frm.events.render_stage_summary(frm));
 	},
 });

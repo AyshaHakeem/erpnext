@@ -44,15 +44,15 @@ frappe.ui.form.on("Timesheet", {
 		if (frm.is_new() && !frm.doc.employee) {
 			set_employee_and_company(frm);
 		}
+
+		if (frm.is_new() && !flt(frm.doc.exchange_rate)) {
+			set_exchange_rate(frm);
+		}
 	},
 
 	refresh: function (frm) {
 		if (frm.doc.docstatus == 1) {
-			if (
-				frm.doc.per_billed < 100 &&
-				frm.doc.total_billable_hours &&
-				frm.doc.total_billable_hours > frm.doc.total_billed_hours
-			) {
+			if (frm.doc.total_billable_hours > frm.doc.total_billed_hours) {
 				frm.add_custom_button(__("Create Sales Invoice"), function () {
 					frm.trigger("make_invoice");
 				});
@@ -62,41 +62,44 @@ frappe.ui.form.on("Timesheet", {
 		if (frm.doc.docstatus < 1) {
 			let button = __("Start Timer");
 			$.each(frm.doc.time_logs || [], function (i, row) {
-				if (row.from_time <= frappe.datetime.now_datetime() && !row.completed) {
+				if (row.from_time <= frappe.datetime.system_datetime() && !row.completed) {
 					button = __("Resume Timer");
 				}
 			});
 
-			frm.add_custom_button(__(button), function () {
-				var flag = true;
-				$.each(frm.doc.time_logs || [], function (i, row) {
-					// Fetch the row for which from_time is not present
-					if (flag && row.activity_type && !row.from_time) {
-						erpnext.timesheet.timer(frm, row);
-						row.from_time = frappe.datetime.now_datetime();
-						frm.refresh_fields("time_logs");
-						frm.save();
-						flag = false;
+			frm.add_custom_button(
+				__(button),
+				function () {
+					var flag = true;
+					$.each(frm.doc.time_logs || [], function (i, row) {
+						// Fetch the row for which from_time is not present
+						if (flag && row.activity_type && !row.from_time) {
+							erpnext.timesheet.timer(frm, row);
+							row.from_time = frappe.datetime.get_datetime_as_string(
+								frappe.datetime.system_datetime()
+							);
+							frm.refresh_fields("time_logs");
+							frm.save();
+							flag = false;
+						}
+						// Fetch the row for timer where activity is not completed and from_time is before now_time
+						if (flag && row.from_time <= frappe.datetime.system_datetime() && !row.completed) {
+							let timestamp = moment(frappe.datetime.system_datetime()).diff(
+								moment(row.from_time),
+								"seconds"
+							);
+							erpnext.timesheet.timer(frm, row, timestamp);
+							flag = false;
+						}
+					});
+					// If no activities found to start a timer, create new
+					if (flag) {
+						erpnext.timesheet.timer(frm);
 					}
-					// Fetch the row for timer where activity is not completed and from_time is before now_time
-					if (flag && row.from_time <= frappe.datetime.now_datetime() && !row.completed) {
-						let timestamp = moment(frappe.datetime.now_datetime()).diff(
-							moment(row.from_time),
-							"seconds"
-						);
-						erpnext.timesheet.timer(frm, row, timestamp);
-						flag = false;
-					}
-				});
-				// If no activities found to start a timer, create new
-				if (flag) {
-					erpnext.timesheet.timer(frm);
-				}
-			}).addClass("btn-primary");
-		}
-		if (frm.doc.per_billed > 0) {
-			frm.fields_dict["time_logs"].grid.toggle_enable("billing_hours", false);
-			frm.fields_dict["time_logs"].grid.toggle_enable("is_billable", false);
+				},
+				null,
+				"primary"
+			);
 		}
 
 		let filters = {
@@ -130,27 +133,12 @@ frappe.ui.form.on("Timesheet", {
 		frm.refresh();
 	},
 
+	company: function (frm) {
+		frm.trigger("currency");
+	},
+
 	currency: function (frm) {
-		let base_currency = frappe.defaults.get_global_default("currency");
-		if (frm.doc.currency && base_currency != frm.doc.currency) {
-			frappe.call({
-				method: "erpnext.setup.utils.get_exchange_rate",
-				args: {
-					from_currency: frm.doc.currency,
-					to_currency: base_currency,
-				},
-				callback: function (r) {
-					if (r.message) {
-						frm.set_value("exchange_rate", flt(r.message));
-						frm.set_df_property(
-							"exchange_rate",
-							"description",
-							"1 " + frm.doc.currency + " = [?] " + base_currency
-						);
-					}
-				},
-			});
-		}
+		set_exchange_rate(frm);
 		frm.trigger("set_dynamic_field_label");
 	},
 
@@ -162,7 +150,7 @@ frappe.ui.form.on("Timesheet", {
 	},
 
 	set_dynamic_field_label: function (frm) {
-		let base_currency = frappe.defaults.get_global_default("currency");
+		let base_currency = erpnext.get_currency(frm.doc.company);
 		frm.set_currency_labels(
 			["base_total_costing_amount", "base_total_billable_amount", "base_total_billed_amount"],
 			base_currency
@@ -177,27 +165,20 @@ frappe.ui.form.on("Timesheet", {
 			frm.doc.currency != base_currency
 		);
 
-		if (frm.doc.time_logs.length > 0) {
-			frm.set_currency_labels(
-				["base_billing_rate", "base_billing_amount", "base_costing_rate", "base_costing_amount"],
-				base_currency,
-				"time_logs"
-			);
-			frm.set_currency_labels(
-				["billing_rate", "billing_amount", "costing_rate", "costing_amount"],
-				frm.doc.currency,
-				"time_logs"
-			);
+		let base_row_fields = [
+			"base_billing_rate",
+			"base_billing_amount",
+			"base_costing_rate",
+			"base_costing_amount",
+		];
+		frm.set_currency_labels(base_row_fields, base_currency, "time_logs");
+		frm.set_currency_labels(
+			["billing_rate", "billing_amount", "costing_rate", "costing_amount"],
+			frm.doc.currency,
+			"time_logs"
+		);
 
-			let time_logs_grid = frm.fields_dict.time_logs.grid;
-			$.each(
-				["base_billing_rate", "base_billing_amount", "base_costing_rate", "base_costing_amount"],
-				function (i, d) {
-					if (frappe.meta.get_docfield(time_logs_grid.doctype, d))
-						time_logs_grid.set_column_disp(d, frm.doc.currency != base_currency);
-				}
-			);
-		}
+		frm.fields_dict.time_logs.grid.set_column_disp(base_row_fields, frm.doc.currency != base_currency);
 		frm.refresh_fields();
 	},
 
@@ -234,9 +215,7 @@ frappe.ui.form.on("Timesheet", {
 			fields: fields,
 		});
 
-		dialog.set_primary_action(__("Create Sales Invoice"), () => {
-			var args = dialog.get_values();
-			if (!args) return;
+		dialog.set_primary_action(__("Create Sales Invoice"), (args) => {
 			dialog.hide();
 			return frappe.call({
 				type: "GET",
@@ -322,6 +301,8 @@ frappe.ui.form.on("Timesheet Detail", {
 		if (frm.doc.parent_project) {
 			frappe.model.set_value(cdt, cdn, "project", frm.doc.parent_project);
 		}
+
+		calculate_time_and_amount(frm);
 	},
 
 	hours: function (frm, cdt, cdn) {
@@ -379,7 +360,12 @@ var calculate_end_time = function (frm, cdt, cdn) {
 
 	if (!child.from_time) {
 		// if from_time value is not available then set the current datetime
-		frappe.model.set_value(cdt, cdn, "from_time", frappe.datetime.get_datetime_as_string());
+		frappe.model.set_value(
+			cdt,
+			cdn,
+			"from_time",
+			frappe.datetime.get_datetime_as_string(frappe.datetime.system_datetime())
+		);
 	}
 
 	let d = moment(child.from_time);
@@ -449,6 +435,38 @@ var calculate_time_and_amount = function (frm) {
 	frm.set_value("total_hours", total_working_hr);
 	frm.set_value("total_billable_amount", total_billable_amount);
 	frm.set_value("total_costing_amount", total_costing_amount);
+};
+
+var set_exchange_rate = function (frm) {
+	let company_currency = erpnext.get_currency(frm.doc.company);
+	// a later call makes this quote stale, so its response is dropped
+	let quote = [frm.doc.currency, company_currency].join("|");
+	frm.exchange_rate_quote = quote;
+
+	if (!frm.doc.currency || frm.doc.currency == company_currency) {
+		frm.set_value("exchange_rate", 1);
+		return;
+	}
+
+	// clear the old quote, so that a failed lookup does not keep it
+	frm.set_value("exchange_rate", 0);
+	frappe.call({
+		method: "erpnext.setup.utils.get_exchange_rate",
+		args: {
+			from_currency: frm.doc.currency,
+			to_currency: company_currency,
+		},
+		callback: function (r) {
+			if (frm.exchange_rate_quote !== quote || !r.message) return;
+
+			frm.set_value("exchange_rate", flt(r.message));
+			frm.set_df_property(
+				"exchange_rate",
+				"description",
+				"1 " + frm.doc.currency + " = [?] " + company_currency
+			);
+		},
+	});
 };
 
 // set employee (and company) to the one that's currently logged in

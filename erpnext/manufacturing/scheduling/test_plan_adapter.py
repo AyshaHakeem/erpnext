@@ -16,6 +16,7 @@ from erpnext.manufacturing.scheduling.plan_adapter import (
 	apply_schedule,
 	build_plan_tasks,
 	get_schedule_preview,
+	get_supplier_lead_times,
 )
 from erpnext.stock.doctype.item.test_item import create_item
 from erpnext.tests.utils import ERPNextTestSuite
@@ -545,6 +546,88 @@ class TestPlanAdapter(ERPNextTestSuite):
 		plan.cancel()
 		self.assertFalse(frappe.db.exists("Production Plan Schedule", {"production_plan": plan.name}))
 
+	def make_draft_plan(self, planned_qty=2):
+		return create_production_plan(
+			item_code="Test PPS FG 2",
+			planned_qty=planned_qty,
+			do_not_submit=True,
+			skip_getting_mr_items=True,
+		)
+
+	def has_schedule(self, plan):
+		return bool(frappe.db.exists("Production Plan Schedule", {"production_plan": plan.name}))
+
+	def test_changing_the_manufacturing_type_changes_the_schedule_signature(self):
+		from erpnext.manufacturing.doctype.production_plan.production_plan import get_schedule_signature
+
+		def plan_with(type_of_manufacturing):
+			row = frappe._dict(
+				name="row-1",
+				production_item="_Test Item",
+				bom_no="BOM-1",
+				qty=5,
+				type_of_manufacturing=type_of_manufacturing,
+			)
+			return frappe._dict(po_items=[], sub_assembly_items=[row])
+
+		self.assertNotEqual(
+			get_schedule_signature(plan_with("In House")), get_schedule_signature(plan_with("Subcontract"))
+		)
+
+	def test_editing_draft_plan_items_clears_schedule(self):
+		plan = self.make_draft_plan()
+		apply_schedule(plan.name, "2026-12-01 09:00:00")
+
+		plan.reload()
+		plan.save()
+		self.assertTrue(self.has_schedule(plan))
+
+		plan.po_items[0].planned_qty = 1
+		plan.save()
+		self.assertFalse(self.has_schedule(plan))
+
+	@change_settings(
+		"Manufacturing Settings",
+		{"mins_between_operations": 10, "allow_overtime": 0, "disable_capacity_planning": 0},
+	)
+	def test_partial_work_order_not_seeded_from_full_row_block(self):
+		plan = self.make_draft_plan()
+		plan.submit()
+		apply_schedule(plan.name, "2026-12-07 09:00:00")
+
+		plan.reload()
+		plan.make_work_order()
+		work_order = frappe.get_doc("Work Order", {"production_plan": plan.name})
+		work_order.qty = 1
+		work_order.set_work_order_operations()
+		work_order.wip_warehouse = "Work In Progress - _TC"
+		work_order.fg_warehouse = work_order.fg_warehouse or "Finished Goods - _TC"
+		work_order.submit()
+
+		job_card = frappe.get_doc("Job Card", {"work_order": work_order.name})
+		self.assertEqual(sum(flt(log.time_in_mins) for log in job_card.scheduled_time_logs), 30)
+
+	def test_closing_plan_releases_its_schedule(self):
+		plan = self.make_draft_plan()
+		plan.submit()
+		apply_schedule(plan.name, "2026-12-14 09:00:00")
+
+		plan.reload()
+		plan.set_status(close=True)
+		self.assertFalse(self.has_schedule(plan))
+
+		plan.reload()
+		plan.set_status(close=False)
+		self.assertFalse(self.has_schedule(plan))
+
+	def test_scheduled_draft_plan_can_be_deleted(self):
+		plan = self.make_draft_plan()
+		apply_schedule(plan.name, "2026-12-21 09:00:00")
+
+		frappe.delete_doc("Production Plan", plan.name)
+		self.assertFalse(frappe.db.exists("Production Plan", plan.name))
+		self.assertFalse(self.has_schedule(plan))
+
 	def test_incomplete_proposal_is_not_applied(self):
 		from unittest.mock import patch
 
@@ -619,7 +702,7 @@ class TestPlanAdapter(ERPNextTestSuite):
 					{
 						"doctype": "Supplier",
 						"supplier_name": supplier,
-						"supplier_group": "All Supplier Groups",
+						"supplier_group": "Services",
 					}
 				).insert()
 
@@ -635,6 +718,17 @@ class TestPlanAdapter(ERPNextTestSuite):
 				],
 			}
 		).insert()
+
+	def test_supplier_lead_times_follow_renamed_item(self):
+		suppliers = ["Test PPS Supplier A", "Test PPS Supplier B"]
+		old_item = create_item("Test PPS Renamed RM Old").name
+		self.make_supplier_lead_time(old_item, suppliers)
+		new_item = frappe.rename_doc("Item", old_item, "Test PPS Renamed RM New")
+		create_item(old_item)
+
+		supplier_lead_times = get_supplier_lead_times([old_item, new_item])
+		self.assertEqual(set(supplier_lead_times), {new_item})
+		self.assertEqual(supplier_lead_times[new_item][suppliers[0]].purchase_time, 3)
 
 	@change_settings("Manufacturing Settings", {"mins_between_operations": 10, "allow_overtime": 0})
 	def test_schedule_uses_supplier_wise_lead_time(self):
@@ -744,3 +838,20 @@ class TestPlanAdapter(ERPNextTestSuite):
 		for row in plan.sub_assembly_items:
 			self.assertIn(get_datetime(row.schedule_date), sub_starts)
 			self.assertIsNotNone(row.schedule_end_date)
+
+	def test_batch_based_operation_is_scheduled_per_batch(self):
+		operation = "Test PPS Op Per Batch"
+		if not frappe.db.exists("Operation", operation):
+			make_operation(operation=operation, workstation=self.workstation)
+		frappe.db.set_value("Operation", operation, "create_job_card_based_on_batch_size", 1)
+
+		item = "Test PPS FG 6"
+		create_item(item, valuation_rate=100)
+		self.make_bom_with_operation(
+			item, ["Test PPS RM"], time_in_mins=60, operations=[operation], batch_size=10
+		)
+		bom_no = frappe.db.get_value("BOM", {"item": item, "docstatus": 1})
+
+		# 60 mins per batch of 10, as the Work Order plans it
+		tasks, _terminal_keys = loaders.build_bom_operation_tasks(bom_no, 10, "row")
+		self.assertEqual(tasks[0].duration_mins, 60)

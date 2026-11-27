@@ -4,8 +4,11 @@
 
 import frappe
 from dateutil.relativedelta import relativedelta
+from frappe import _, bold
 from frappe.model.document import Document
 from frappe.utils import cint
+
+DEFAULT_CAPACITY_PLANNING_DAYS = 30
 
 
 class ManufacturingSettings(Document):
@@ -25,6 +28,7 @@ class ManufacturingSettings(Document):
 		backflush_raw_materials_based_on: DF.Literal["BOM", "Material Transferred for Manufacture"]
 		capacity_planning_for_days: DF.Int
 		disable_capacity_planning: DF.Check
+		enable_operations_and_job_cards: DF.Check
 		enforce_time_logs: DF.Check
 		get_rm_cost_from_consumption_entry: DF.Check
 		job_card_excess_transfer: DF.Check
@@ -39,8 +43,35 @@ class ManufacturingSettings(Document):
 		validate_components_quantities_per_bom: DF.Check
 	# end: auto-generated types
 
+	def validate(self):
+		self.validate_operations_and_job_cards()
+
+	def on_update(self):
+		self.clear_boot_cache()
+
+	def validate_operations_and_job_cards(self):
+		if self.enable_operations_and_job_cards or not self.has_value_changed(
+			"enable_operations_and_job_cards"
+		):
+			return
+
+		if frappe.db.exists("BOM", {"with_operations": 1, "docstatus": ("<", 2)}):
+			frappe.throw(
+				_("Cannot disable {0}, as there are BOMs with operations.").format(
+					bold(self.meta.get_translated_label("enable_operations_and_job_cards"))
+				)
+			)
+
+	def clear_boot_cache(self):
+		if self.has_value_changed("enable_operations_and_job_cards"):
+			frappe.cache.delete_key("bootinfo")
+			frappe.db.after_commit.add(lambda: frappe.cache.delete_key("bootinfo"))
+
 	def before_save(self):
 		self.reset_values()
+		self.capacity_planning_for_days = (
+			cint(self.capacity_planning_for_days) or DEFAULT_CAPACITY_PLANNING_DAYS
+		)
 
 	def reset_values(self):
 		if self.backflush_raw_materials_based_on != "BOM" and self.validate_components_quantities_per_bom:
@@ -49,7 +80,14 @@ class ManufacturingSettings(Document):
 
 def get_mins_between_operations():
 	return relativedelta(
-		minutes=cint(frappe.db.get_single_value("Manufacturing Settings", "mins_between_operations")) or 10
+		minutes=cint(frappe.db.get_single_value("Manufacturing Settings", "mins_between_operations"))
+	)
+
+
+def get_capacity_planning_days():
+	return (
+		cint(frappe.db.get_single_value("Manufacturing Settings", "capacity_planning_for_days"))
+		or DEFAULT_CAPACITY_PLANNING_DAYS
 	)
 
 

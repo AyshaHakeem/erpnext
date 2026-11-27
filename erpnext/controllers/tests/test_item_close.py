@@ -10,7 +10,11 @@ from erpnext.buying.doctype.purchase_order.mapper import (
 )
 from erpnext.buying.doctype.purchase_order.test_purchase_order import create_purchase_order
 from erpnext.controllers.item_close import update_closed_status
+from erpnext.controllers.sales_and_purchase_return import make_return_doc
 from erpnext.stock.doctype.item.test_item import make_item
+from erpnext.stock.doctype.purchase_receipt.mapper import (
+	make_purchase_invoice as make_purchase_invoice_from_receipt,
+)
 from erpnext.tests.utils import ERPNextTestSuite
 
 WAREHOUSE = "_Test Warehouse - _TC"
@@ -55,6 +59,12 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 		self.assertEqual(get_ordered_qty(self.second_item), 0)
 		self.assertEqual(get_ordered_qty(self.first_item), 10)
 
+		self.close_items(po, [po.items[1]], closed=0)
+
+		self.assertEqual(get_ordered_qty(self.second_item), 10)
+		self.assertEqual(po.per_received, 0)
+		self.assertEqual(po.status, "To Receive and Bill")
+
 	def test_closing_row_settles_receiving_percentage(self):
 		po = self.make_purchase_order()
 
@@ -71,6 +81,8 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 
 		self.assertEqual(po.per_received, 100)
 		self.assertEqual(po.status, "To Bill")
+		self.assertFalse(po.has_pending_receivable_qty())
+		self.assertFalse(make_purchase_receipt(po.name).get("items"))
 
 	def test_closing_every_row_closes_the_order(self):
 		po = self.make_purchase_order()
@@ -90,18 +102,6 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 		po.reload()
 		self.assertEqual(po.status, "Closed")
 		self.assertTrue(all(row.closed for row in po.items))
-
-	def test_reopening_all_rows_restores_the_order(self):
-		po = self.make_purchase_order()
-		self.close_items(po, po.items)
-		self.assertEqual(po.status, "Closed")
-
-		self.close_items(po, po.items, closed=0)
-
-		self.assertFalse(any(row.closed for row in po.items))
-		self.assertEqual(po.per_received, 0)
-		self.assertEqual(po.status, "To Receive and Bill")
-		self.assertEqual(get_ordered_qty(self.first_item), 10)
 
 	def test_reopening_one_row_reopens_the_parent(self):
 		po = self.make_purchase_order()
@@ -148,21 +148,6 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 		self.assertEqual(po.per_received, 100)
 		self.assertEqual(po.status, "Closed")
 
-	def test_receipt_is_not_offered_when_the_rest_is_closed(self):
-		po = self.make_purchase_order()
-
-		receipt = make_purchase_receipt(po.name)
-		receipt.items = [item for item in receipt.items if item.item_code == self.first_item]
-		receipt.insert()
-		receipt.submit()
-
-		po.reload()
-		self.close_items(po, [po.items[1]])
-
-		self.assertEqual(po.status, "To Bill")
-		self.assertFalse(po.has_pending_receivable_qty())
-		self.assertFalse(make_purchase_receipt(po.name).get("items"))
-
 	def test_reopening_partly_closed_order_keeps_row_flags(self):
 		po = self.make_purchase_order()
 		self.close_items(po, [po.items[1]])
@@ -196,17 +181,6 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 		receipt.insert()
 		self.assertRaises(frappe.ValidationError, receipt.submit)
 
-	def test_reopening_a_row_restores_pending_qty(self):
-		po = self.make_purchase_order()
-		self.close_items(po, [po.items[1]])
-		self.assertEqual(get_ordered_qty(self.second_item), 0)
-
-		self.close_items(po, [po.items[1]], closed=0)
-
-		self.assertEqual(get_ordered_qty(self.second_item), 10)
-		self.assertEqual(po.per_received, 0)
-		self.assertEqual(po.status, "To Receive and Bill")
-
 	def test_closing_is_rejected_for_unsupported_doctype(self):
 		self.assertRaises(
 			frappe.ValidationError,
@@ -229,3 +203,25 @@ class TestPurchaseOrderItemClose(ERPNextTestSuite):
 		amended.insert()
 
 		self.assertFalse(any(row.closed for row in amended.items))
+
+	def test_received_goods_of_a_closed_row_can_be_billed_and_returned(self):
+		po = self.make_purchase_order()
+		receipt = make_purchase_receipt(po.name)
+		receipt.insert()
+		receipt.submit()
+
+		po.reload()
+		self.close_items(po, [po.items[0]])
+
+		invoice = make_purchase_invoice_from_receipt(receipt.name)
+		invoice.insert()
+		invoice.submit()
+
+		return_receipt = make_return_doc("Purchase Receipt", receipt.name)
+		return_receipt.items = [row for row in return_receipt.items if row.item_code == self.first_item]
+		return_receipt.items[0].qty = return_receipt.items[0].received_qty = -2
+		return_receipt.insert()
+		return_receipt.submit()
+
+		po.reload()
+		self.assertEqual(po.items[0].returned_qty, 2)

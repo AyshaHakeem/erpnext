@@ -9,6 +9,7 @@ from frappe.core.doctype.communication.email import make
 from frappe.desk.form.load import get_attachments
 from frappe.model.document import Document
 from frappe.utils import get_url
+from frappe.utils.html_utils import sanitize_html
 from frappe.utils.print_format import download_pdf
 from frappe.utils.user import get_user_fullname
 
@@ -73,21 +74,32 @@ class RequestforQuotation(BuyingController):
 
 	def validate(self):
 		self.validate_duplicate_supplier()
+		self.ensure_supplier_is_not_blocked()
 		self.validate_supplier_list()
 		super().validate_qty_is_not_zero()
 		validate_for_items(self)
+		self.set_missing_item_names()
 		super().set_qty_as_per_stock_uom()
+		self.validate_uom_is_integer("uom", "qty")
+		self.validate_uom_is_integer("stock_uom", "stock_qty")
 		self.update_email_id()
+		self.validate_with_previous_doc()
 
 		if self.docstatus < 1:
 			# after amend and save, status still shows as cancelled, until submit
 			self.db_set("status", "Draft")
+
+	def set_missing_item_names(self):
+		for row in self.items:
+			if row.item_code and not row.item_name:
+				row.item_name = frappe.get_cached_value("Item", row.item_code, "item_name")
 
 	def set_has_unit_price_items(self):
 		"""
 		If permitted in settings and any item has 0 qty, the RFQ has unit price items.
 		"""
 		if not frappe.db.get_single_value("Buying Settings", "allow_zero_qty_in_request_for_quotation"):
+			self.has_unit_price_items = 0
 			return
 
 		self.has_unit_price_items = any(
@@ -115,6 +127,22 @@ class RequestforQuotation(BuyingController):
 			if not self.subject:
 				self.subject = data.subject
 
+	def validate_with_previous_doc(self):
+		super().validate_with_previous_doc(
+			{
+				"Material Request": {
+					"ref_dn_field": "material_request",
+					"compare_fields": [["company", "="]],
+				},
+				"Material Request Item": {
+					"ref_dn_field": "material_request_item",
+					"compare_fields": [["item_code", "="], ["uom", "="]],
+					"is_child_table": True,
+					"allow_duplicate_prev_row_id": True,
+				},
+			}
+		)
+
 	def validate_duplicate_supplier(self):
 		supplier_list = [d.supplier for d in self.suppliers]
 		if len(supplier_list) != len(set(supplier_list)):
@@ -126,7 +154,7 @@ class RequestforQuotation(BuyingController):
 
 			prevent_rfqs = frappe.db.get_value("Supplier", d.supplier, "prevent_rfqs")
 			if prevent_rfqs:
-				standing = frappe.db.get_value("Supplier Scorecard", d.supplier, "status")
+				standing = frappe.db.get_value("Supplier Scorecard", {"supplier": d.supplier}, "status")
 				frappe.throw(
 					_("RFQs are not allowed for {0} due to a scorecard standing of {1}").format(
 						d.supplier, standing
@@ -134,7 +162,7 @@ class RequestforQuotation(BuyingController):
 				)
 			warn_rfqs = frappe.db.get_value("Supplier", d.supplier, "warn_rfqs")
 			if warn_rfqs:
-				standing = frappe.db.get_value("Supplier Scorecard", d.supplier, "status")
+				standing = frappe.db.get_value("Supplier Scorecard", {"supplier": d.supplier}, "status")
 				frappe.msgprint(
 					_(
 						"{0} currently has a {1} Supplier Scorecard standing, and RFQs to this supplier should be issued with caution."
@@ -184,6 +212,7 @@ class RequestforQuotation(BuyingController):
 		self.validate_email_id(rfq_supplier)
 
 		message = self.supplier_rfq_mail(rfq_supplier, "", self.get_link(), True)
+		message["message"] = sanitize_html(message["message"])
 
 		return message
 
@@ -258,7 +287,7 @@ class RequestforQuotation(BuyingController):
 
 	def update_user_in_supplier(self, supplier, user):
 		"""Update user in Supplier."""
-		if not frappe.db.exists("Portal User", {"parent": supplier, "user": user}):
+		if not frappe.db.exists("Portal User", {"parenttype": "Supplier", "parent": supplier, "user": user}):
 			supplier_doc = frappe.get_doc("Supplier", supplier)
 			supplier_doc.append(
 				"portal_users",
@@ -285,17 +314,17 @@ class RequestforQuotation(BuyingController):
 		user = frappe.get_doc(
 			{
 				"doctype": "User",
-				"send_welcome_email": 0,
+				"send_welcome_email": 1,
 				"email": rfq_supplier.email_id,
 				"first_name": contact_name or rfq_supplier.supplier_name or rfq_supplier.supplier,
 				"user_type": "Website User",
 				"redirect_url": link,
+				"roles": [{"role": "Supplier"}],
 			}
 		)
 		user.save(ignore_permissions=True)
-		update_password_link = user._reset_password()
 
-		return user, update_password_link
+		return user, get_url("/login#forgot")
 
 	def supplier_rfq_mail(self, data, update_password_link, rfq_link, preview=False):
 		full_name = get_user_fullname(frappe.session["user"])
@@ -411,10 +440,10 @@ class RequestforQuotation(BuyingController):
 				supplier.quote_status = quote_status
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def send_supplier_emails(rfq_name: str):
 	check_portal_enabled("Request for Quotation")
-	rfq = frappe.get_doc("Request for Quotation", rfq_name)
+	rfq = frappe.get_doc("Request for Quotation", rfq_name, check_permission="write")
 	if rfq.docstatus == 1:
 		rfq.send_to_supplier()
 

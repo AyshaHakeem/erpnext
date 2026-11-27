@@ -7,6 +7,7 @@ import json
 import frappe
 from frappe import _, scrub
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
+from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 from frappe.database.schema import validate_column_name
 from frappe.model import core_doctypes_list
 from frappe.model.document import Document
@@ -15,6 +16,9 @@ from frappe.utils import cstr
 from erpnext.accounts.doctype.repost_accounting_ledger.repost_accounting_ledger import (
 	get_allowed_types_from_settings,
 )
+
+# Document names cannot contain ">", so this cannot collide with a dimension value.
+BLANK_ACCOUNTING_DIMENSION = "__blank__>"
 
 
 class AccountingDimension(Document):
@@ -43,7 +47,8 @@ class AccountingDimension(Document):
 	def validate(self):
 		self.validate_doctype()
 		validate_column_name(self.fieldname)
-		self.validate_fieldname_conflict()
+		if self.has_value_changed("fieldname"):
+			self.validate_fieldname_conflict()
 		self.validate_dimension_defaults()
 
 	def validate_doctype(self):
@@ -113,12 +118,15 @@ class AccountingDimension(Document):
 				frappe.throw(_("Company {0} is added more than once").format(frappe.bold(default.company)))
 
 	def on_update(self):
+		# Field creation reads the dimensions before the framework's post-save cache clear.
+		self.clear_cache()
 		if frappe.in_test:
 			make_dimension_in_accounting_doctypes(doc=self)
 		else:
 			frappe.enqueue(
 				make_dimension_in_accounting_doctypes, doc=self, queue="long", enqueue_after_commit=True
 			)
+		update_dimension_filter_options()
 
 	def on_trash(self):
 		if frappe.in_test:
@@ -219,8 +227,31 @@ def delete_accounting_dimension(doc):
 	budget_against_property.value = "\nCost Center\nProject\n" + "\n".join(value_list)
 	budget_against_property.save()
 
+	for name in frappe.get_all(
+		"Accounting Dimension Filter", filters={"accounting_dimension": doc.document_type}, pluck="name"
+	):
+		frappe.delete_doc("Accounting Dimension Filter", name, ignore_permissions=True)
+
+	update_dimension_filter_options(exclude=doc.document_type)
+
 	for doctype in doclist:
 		frappe.clear_cache(doctype=doctype)
+
+
+def update_dimension_filter_options(exclude=None):
+	dimensions = frappe.get_all(
+		"Accounting Dimension",
+		filters={"document_type": ["!=", exclude]} if exclude else None,
+		pluck="document_type",
+		order_by="creation",
+	)
+	options = "\n".join(["", "Cost Center", "Project", *dimensions])
+
+	meta = frappe.get_meta("Accounting Dimension Filter")
+	if meta.get_field("accounting_dimension").options == options:
+		return
+
+	make_property_setter("Accounting Dimension Filter", "accounting_dimension", "options", options, "Text")
 
 
 @frappe.whitelist(methods=["POST"])
@@ -259,19 +290,30 @@ def get_doctypes_with_dimensions():
 
 
 def get_accounting_dimensions(as_list=True):
-	accounting_dimensions = frappe.get_all(
-		"Accounting Dimension",
-		fields=["label", "fieldname", "disabled", "document_type"],
-		filters={"disabled": 0},
-	)
+	# The database value cache is cleared on document changes and transaction boundaries.
+	cache = frappe.db.value_cache["Accounting Dimension"]
+	cache_key = ("get_accounting_dimensions",)
+	if cache_key not in cache:
+		cache[cache_key] = frappe.get_all(
+			"Accounting Dimension",
+			fields=["label", "fieldname", "disabled", "document_type"],
+			filters={"disabled": 0},
+		)
 
 	if as_list:
-		return [d.fieldname for d in accounting_dimensions]
+		return [d.fieldname for d in cache[cache_key]]
 	else:
-		return accounting_dimensions
+		return [d.copy() for d in cache[cache_key]]
 
 
 def get_checks_for_pl_and_bs_accounts():
+	cache = frappe.db.value_cache["Accounting Dimension"]
+	detail_cache = frappe.db.value_cache["Accounting Dimension Detail"]
+	cache_key = ("get_checks_for_pl_and_bs_accounts",)
+	# Both tables must retain the result; changing either invalidates the joined lookup.
+	if cache_key in cache and cache[cache_key] is detail_cache.get(cache_key):
+		return [d.copy() for d in cache[cache_key]]
+
 	AccountingDimension = frappe.qb.DocType("Accounting Dimension")
 	AccountingDimensionDetail = frappe.qb.DocType("Accounting Dimension Detail")
 
@@ -291,7 +333,8 @@ def get_checks_for_pl_and_bs_accounts():
 		.where(AccountingDimension.disabled == 0)
 	)
 
-	return query.run(as_dict=1)
+	cache[cache_key] = detail_cache[cache_key] = query.run(as_dict=1)
+	return [d.copy() for d in cache[cache_key]]
 
 
 def get_dimension_with_children(doctype, dimensions):
@@ -308,7 +351,54 @@ def get_dimension_with_children(doctype, dimensions):
 	return all_dimensions
 
 
-@frappe.whitelist()
+def get_dimension_filter_values(values, dimension_doctype=None):
+	if isinstance(values, str):
+		try:
+			parsed_values = json.loads(values)
+		except json.JSONDecodeError:
+			pass
+		else:
+			if isinstance(parsed_values, list):
+				values = parsed_values
+
+	if values is None:
+		values = []
+	elif not isinstance(values, list | tuple):
+		values = [values]
+
+	include_blank = BLANK_ACCOUNTING_DIMENSION in values
+	values = [value for value in values if value != BLANK_ACCOUNTING_DIMENSION]
+
+	if values and dimension_doctype and frappe.get_cached_value("DocType", dimension_doctype, "is_tree"):
+		values = get_dimension_with_children(dimension_doctype, values)
+
+	return values, include_blank
+
+
+def get_dimension_filter_condition(field, values, dimension_doctype=None):
+	values, include_blank = get_dimension_filter_values(values, dimension_doctype)
+	condition = field.isin(values) if values else None
+
+	if include_blank:
+		blank_condition = field.isnull() | (field == "")
+		condition = condition | blank_condition if condition else blank_condition
+
+	return condition
+
+
+def get_dimension_filter_sql_condition(fieldname, values, dimension_doctype=None):
+	values, include_blank = get_dimension_filter_values(values, dimension_doctype)
+	parts = []
+
+	if values:
+		parts.append(f"{fieldname} IN ({', '.join(['?'] * len(values))})")
+
+	if include_blank:
+		parts.append(f"({fieldname} IS NULL OR {fieldname} = '')")
+
+	return f"({' OR '.join(parts)})" if parts else None, values
+
+
 def get_dimensions(with_cost_center_and_project: str | bool = False):
 	c = frappe.qb.DocType("Accounting Dimension Detail")
 	p = frappe.qb.DocType("Accounting Dimension")
@@ -343,6 +433,20 @@ def get_dimensions(with_cost_center_and_project: str | bool = False):
 		default_dimensions_map[dimension.company][dimension.fieldname] = dimension.default_dimension
 
 	return dimension_filters, default_dimensions_map
+
+
+@frappe.whitelist()
+def get_dimensions_for_user(with_cost_center_and_project: str | bool = False):
+	"""`get_dimensions` for client scripts, with defaults only for the companies the user can see.
+
+	`override_whitelisted_methods` sends calls to `get_dimensions` here.
+	"""
+	# raises PermissionError for users without access to Company, such as Website Users
+	companies = set(frappe.get_list("Company", pluck="name"))
+	dimension_filters, default_dimensions_map = get_dimensions(with_cost_center_and_project)
+	return dimension_filters, {
+		company: defaults for company, defaults in default_dimensions_map.items() if company in companies
+	}
 
 
 def create_accounting_dimensions_for_doctype(doctype):

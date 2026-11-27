@@ -10,11 +10,12 @@ from frappe import _, throw
 from frappe.utils import cint, flt, parse_json
 
 import erpnext
+from erpnext import _refuse, require_permission
 from erpnext.stock.get_item_details import (
 	NOT_APPLICABLE_TAX,
+	_get_item_tax_map,
 	_get_item_tax_template,
 	_get_item_tax_template_from_item_group,
-	get_item_tax_map,
 )
 
 
@@ -72,7 +73,7 @@ class TaxService:
 		if doc.get("taxes_and_charges"):
 			if not tax_master_doctype:
 				tax_master_doctype = doc.meta.get_field("taxes_and_charges").options
-			doc.extend("taxes", get_taxes_and_charges(tax_master_doctype, doc.get("taxes_and_charges")))
+			doc.extend("taxes", _get_taxes_and_charges(tax_master_doctype, doc.get("taxes_and_charges")))
 
 	def append_taxes_from_item_tax_template(self) -> None:
 		doc = self.doc
@@ -204,11 +205,24 @@ def validate_tax_master(master_doctype: str, master_name: str | None = None) -> 
 
 @frappe.whitelist()
 def get_tax_rate(account_head: str) -> dict:
+	ptype = "select" if frappe.only_has_select_perm("Account") else "read"
+	if not frappe.has_permission("Account", ptype, account_head):
+		_refuse()
+
 	return frappe.get_cached_value("Account", account_head, ["tax_rate", "account_name"], as_dict=True)
 
 
 @frappe.whitelist()
 def get_default_taxes_and_charges(
+	master_doctype: str, tax_template: str | None = None, company: str | None = None
+) -> dict | None:
+	default = _get_default_taxes_and_charges(master_doctype, tax_template, company)
+	if default and default.get("taxes_and_charges"):
+		require_permission(master_doctype, default["taxes_and_charges"], "select")
+	return default
+
+
+def _get_default_taxes_and_charges(
 	master_doctype: str, tax_template: str | None = None, company: str | None = None
 ) -> dict | None:
 	if not company:
@@ -225,12 +239,18 @@ def get_default_taxes_and_charges(
 
 	return {
 		"taxes_and_charges": default_tax,
-		"taxes": get_taxes_and_charges(master_doctype, default_tax),
+		"taxes": _get_taxes_and_charges(master_doctype, default_tax),
 	}
 
 
 @frappe.whitelist()
 def get_taxes_and_charges(master_doctype: str, master_name: str | None = None) -> list | None:
+	if master_name:
+		require_permission(master_doctype, master_name, "select")
+	return _get_taxes_and_charges(master_doctype, master_name)
+
+
+def _get_taxes_and_charges(master_doctype: str, master_name: str | None = None) -> list | None:
 	if not master_name:
 		return
 
@@ -346,11 +366,32 @@ def validate_inclusive_tax(tax, doc) -> None:
 		):
 			_on_previous_row_error(tax.row_id)
 		elif tax.charge_type == "On Previous Row Total" and not all(
-			[cint(t.included_in_print_rate) for t in doc.get("taxes")[: cint(tax.row_id) - 1]]
+			[cint(t.included_in_print_rate) for t in doc.get("taxes")[: cint(tax.row_id)]]
 		):
 			_on_previous_row_error("1 - %d" % (tax.row_id,))
 		elif tax.get("category") == "Valuation":
 			frappe.throw(_("Valuation type charges can not be marked as Inclusive"))
+
+
+def is_deduct_with_valuation(tax) -> bool:
+	return tax.get("category") == "Valuation" and tax.get("add_deduct_tax") == "Deduct"
+
+
+def validate_deduct_with_valuation_category(
+	taxes: list | None, allowed_account_heads: set | None = None
+) -> None:
+	for tax in taxes or []:
+		if is_deduct_with_valuation(tax) and tax.account_head not in (allowed_account_heads or set()):
+			throw(
+				_("Row {0}: {1} cannot be {2} when {3} is {4}").format(
+					tax.idx,
+					frappe.bold(_("Add or Deduct")),
+					frappe.bold(_("Deduct")),
+					frappe.bold(_("Consider Tax or Charge for")),
+					frappe.bold(_("Valuation")),
+				),
+				title=_("Invalid Tax Row"),
+			)
 
 
 def set_balance_in_account_currency(
@@ -396,7 +437,7 @@ def set_child_tax_template_and_map(item, child_item, parent_doc) -> None:
 		item_tax_template = _get_item_tax_template_from_item_group(ctx, item.item_group)
 
 	child_item.item_tax_template = item_tax_template
-	child_item.item_tax_rate = get_item_tax_map(
+	child_item.item_tax_rate = _get_item_tax_map(
 		doc=parent_doc,
 		tax_template=child_item.item_tax_template,
 		as_json=True,

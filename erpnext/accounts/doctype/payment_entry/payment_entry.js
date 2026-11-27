@@ -2,8 +2,6 @@
 // For license information, please see license.txt
 frappe.provide("erpnext.accounts.dimensions");
 
-cur_frm.cscript.tax_table = "Advance Taxes and Charges";
-
 erpnext.accounts.taxes.setup_tax_validations("Payment Entry");
 erpnext.accounts.taxes.setup_tax_filters("Advance Taxes and Charges");
 
@@ -46,6 +44,18 @@ frappe.ui.form.on("Payment Entry", {
 	},
 
 	setup: function (frm) {
+		frm.cscript.tax_table = "Advance Taxes and Charges";
+		frm.set_query("mode_of_payment", () => ({ filters: { enabled: 1 } }));
+		frm.add_fetch("mode_of_payment", "type", "mode_of_payment_type");
+
+		if (frappe.is_mobile()) {
+			frm.get_field("references").grid.editable_fields = [
+				{ fieldname: "reference_name", columns: 4 },
+				{ fieldname: "outstanding_amount", columns: 3 },
+				{ fieldname: "allocated_amount", columns: 3 },
+			];
+		}
+
 		frm.set_query("paid_from", function (doc) {
 			frm.events.validate_company(frm);
 
@@ -71,7 +81,6 @@ frappe.ui.form.on("Payment Entry", {
 		});
 
 		frm.set_query("party_type", function () {
-			frm.events.validate_company(frm);
 			return {
 				filters: {
 					name: ["in", Object.keys(frappe.boot.party_account_types)],
@@ -245,8 +254,18 @@ frappe.ui.form.on("Payment Entry", {
 		frm.events.hide_unhide_fields(frm);
 		frm.events.set_dynamic_labels(frm);
 		frm.events.show_general_ledger(frm);
+		frm.events.set_party_description(frm);
+		frm.events.set_difference_description(frm);
+		frm.events.setup_reference_buttons(frm);
+		frm.events.show_allocate_button(frm);
 		erpnext.accounts.ledger_preview.show_accounting_ledger_preview(frm);
+		// internal transfers have no party, so nothing hits the payment ledger
+		if (frm.doc.party) {
+			erpnext.accounts.show_payment_ledger(frm);
+			erpnext.accounts.ledger_preview.show_payment_ledger_preview(frm);
+		}
 		if (
+			frm.doc.docstatus === 1 &&
 			frm.doc.references &&
 			frm.doc.references.find((elem) => {
 				return elem.exchange_gain_loss != 0;
@@ -260,7 +279,7 @@ frappe.ui.form.on("Payment Entry", {
 						reference_name: frm.doc.name,
 					});
 				},
-				__("Actions")
+				__("View")
 			);
 		}
 		erpnext.accounts.unreconcile_payment.add_unreconcile_btn(frm);
@@ -308,6 +327,11 @@ frappe.ui.form.on("Payment Entry", {
 		);
 
 		frm.toggle_display("base_paid_amount", frm.doc.paid_from_account_currency != company_currency);
+		frm.toggle_display(
+			"paid_from_account_currency",
+			frm.doc.paid_from_account_currency != company_currency
+		);
+		frm.toggle_display("paid_to_account_currency", frm.doc.paid_to_account_currency != company_currency);
 
 		if (frm.doc.payment_type == "Pay") {
 			frm.toggle_display(
@@ -370,8 +394,11 @@ frappe.ui.form.on("Payment Entry", {
 			company_currency
 		);
 
-		frm.set_currency_labels(["paid_amount"], frm.doc.paid_from_account_currency);
-		frm.set_currency_labels(["received_amount"], frm.doc.paid_to_account_currency);
+		frm.set_currency_labels(["paid_amount", "paid_amount_after_tax"], frm.doc.paid_from_account_currency);
+		frm.set_currency_labels(
+			["received_amount", "received_amount_after_tax"],
+			frm.doc.paid_to_account_currency
+		);
 
 		var party_account_currency =
 			frm.doc.payment_type == "Receive"
@@ -379,33 +406,25 @@ frappe.ui.form.on("Payment Entry", {
 				: frm.doc.paid_to_account_currency;
 
 		frm.set_currency_labels(
-			["total_allocated_amount", "unallocated_amount", "total_taxes_and_charges"],
+			[
+				"total_outstanding_amount",
+				"total_allocated_amount",
+				"unallocated_amount",
+				"total_taxes_and_charges",
+			],
 			party_account_currency
 		);
 
 		var currency_field =
 			frm.doc.payment_type == "Receive" ? "paid_from_account_currency" : "paid_to_account_currency";
+		frm.set_df_property("total_outstanding_amount", "options", currency_field);
 		frm.set_df_property("total_allocated_amount", "options", currency_field);
 		frm.set_df_property("unallocated_amount", "options", currency_field);
 		frm.set_df_property("total_taxes_and_charges", "options", currency_field);
 
-		frm.set_currency_labels(
-			["total_amount", "outstanding_amount", "allocated_amount"],
-			party_account_currency,
-			"references"
-		);
-
-		frm.set_df_property(
-			"source_exchange_rate",
-			"description",
-			"1 " + frm.doc.paid_from_account_currency + " = [?] " + company_currency
-		);
-
-		frm.set_df_property(
-			"target_exchange_rate",
-			"description",
-			"1 " + frm.doc.paid_to_account_currency + " = [?] " + company_currency
-		);
+		frm.events.set_exchange_rate_descriptions(frm);
+		frm.events.set_account_descriptions(frm);
+		frm.events.set_display_labels(frm);
 
 		frm.refresh_fields();
 
@@ -420,26 +439,274 @@ frappe.ui.form.on("Payment Entry", {
 		reference_grid.refresh();
 	},
 
-	show_general_ledger: function (frm) {
-		if (frm.doc.docstatus > 0) {
-			frm.add_custom_button(__("Ledger"), function () {
+	show_allocate_button: function (frm) {
+		if (
+			frm.doc.docstatus !== 1 ||
+			!(flt(frm.doc.unallocated_amount) > 0) ||
+			!["Customer", "Supplier"].includes(frm.doc.party_type) ||
+			!frappe.model.can_write("Payment Reconciliation")
+		) {
+			return;
+		}
+
+		frm.add_custom_button(
+			__("Allocate to Invoices"),
+			() => {
 				frappe.route_options = {
-					voucher_no: frm.doc.name,
-					from_date: frm.doc.posting_date,
-					to_date: moment(frm.doc.modified).format("YYYY-MM-DD"),
 					company: frm.doc.company,
-					categorize_by: "",
-					show_cancelled_entries: frm.doc.docstatus === 2,
+					party_type: frm.doc.party_type,
+					party: frm.doc.party,
+					payment_name: frm.doc.name,
 				};
-				frappe.set_route("query-report", "General Ledger");
+				frappe.set_route("Form", "Payment Reconciliation");
+			},
+			__("Actions")
+		);
+	},
+
+	setup_reference_buttons: function (frm) {
+		frm.fields_dict.references.grid
+			.add_custom_button(__("Get Outstanding"), () => frm.trigger("get_outstanding_invoices"), "top")
+			.toggle(frm.doc.docstatus === 0);
+	},
+
+	get_party_amount: function (frm) {
+		return frm.doc.payment_type == "Receive" ? frm.doc.paid_amount : frm.doc.received_amount;
+	},
+
+	is_amount_from_references: function (frm) {
+		return frm.amount_from_references === frm.doc.name;
+	},
+
+	get_invoice_outstanding: function (frm) {
+		const order_doctypes = frm.events.get_order_doctypes(frm);
+		return (frm.doc.references || [])
+			.filter((row) => !order_doctypes.includes(row.reference_doctype))
+			.reduce((total, row) => total + flt(row.outstanding_amount), 0);
+	},
+
+	is_outstanding_in_payment_direction: function (frm) {
+		const net_outstanding = frm.events.get_invoice_outstanding(frm);
+		const settles_invoices =
+			(frm.doc.payment_type == "Receive" && frm.doc.party_type == "Customer") ||
+			(frm.doc.payment_type == "Pay" && ["Supplier", "Employee"].includes(frm.doc.party_type));
+		return settles_invoices ? net_outstanding > 0 : net_outstanding < 0;
+	},
+
+	set_default_bank_cash_account: async function (frm) {
+		const bank_field = { Receive: "paid_to", Pay: "paid_from" }[frm.doc.payment_type];
+		const is_chosen = () => frm.doc[bank_field] || frm.doc.mode_of_payment || frm.doc.bank_account;
+		if (!bank_field || frm.doc[bank_field] || frm.doc.mode_of_payment) return;
+		if (frm.doc.bank_account) return frm.trigger("bank_account");
+
+		const { company, payment_type } = frm.doc;
+		for (const account_type of ["Bank", "Cash"]) {
+			const { message } = await frappe.call({
+				method: "erpnext.accounts.doctype.journal_entry.journal_entry.get_default_bank_cash_account",
+				args: { company, account_type, fetch_balance: 0 },
 			});
+			if (is_chosen() || frm.doc.company != company || frm.doc.payment_type != payment_type) return;
+			if (message?.account) return frm.set_value(bank_field, message.account);
 		}
 	},
 
-	payment_type: function (frm) {
+	sync_references_with_accounts: function (frm) {
+		if (frm.doc.references?.length && frm.events.is_amount_from_references(frm)) {
+			frm.events.set_total_allocated_amount(frm);
+		}
+	},
+
+	set_exchange_rate_descriptions: function (frm) {
+		const company_currency = frm.doc.company
+			? frappe.get_doc(":Company", frm.doc.company)?.default_currency
+			: "";
+		const describe = (currency, rate) =>
+			"1 " + currency + " = " + (flt(rate) ? flt(rate, 9) : "[?]") + " " + company_currency;
+
+		frm.set_df_property(
+			"source_exchange_rate",
+			"description",
+			describe(frm.doc.paid_from_account_currency, frm.doc.source_exchange_rate)
+		);
+		frm.set_df_property(
+			"target_exchange_rate",
+			"description",
+			describe(frm.doc.paid_to_account_currency, frm.doc.target_exchange_rate)
+		);
+	},
+
+	set_display_labels: function (frm) {
+		frm.set_df_property("party", "label", frm.doc.party_type ? __(frm.doc.party_type) : __("Party"));
+		frm.set_df_property("reference_no", "label", __("Reference Number"));
+		frm.set_df_property("reference_date", "label", __("Reference Date"));
+		[
+			[
+				"book_advance_payments_in_separate_party_account",
+				__("Book advance payments in separate party account"),
+			],
+			["apply_tds", __("Consider for tax withholding")],
+			["ignore_tax_withholding_threshold", __("Ignore tax withholding threshold")],
+			["override_tax_withholding_entries", __("Edit tax withholding entries")],
+			["custom_remarks", __("Custom remarks")],
+		].forEach(([fieldname, label]) => frm.set_df_property(fieldname, "label", label));
+
+		const currency = frm.doc.paid_from_account_currency;
+		const single_currency = currency && currency === frm.doc.paid_to_account_currency;
+		const same_currency_transfer = single_currency && frm.doc.payment_type === "Internal Transfer";
+		if (frm.doc.payment_type === "Receive" && single_currency) {
+			frm.fields_dict.paid_amount.set_label(__("Received Amount") + " (" + currency + ")");
+		}
+		if (same_currency_transfer) {
+			frm.fields_dict.paid_amount.set_label(__("Paid Amount") + " (" + currency + ")");
+		}
+		frm.set_df_property(
+			"received_amount",
+			"description",
+			same_currency_transfer
+				? __(
+						"Reduce this if the bank deducted a fee. The difference is added under Deductions or Loss on save."
+				  )
+				: ""
+		);
+
+		frm.events.set_bank_total_description(frm);
+	},
+
+	set_bank_total_description: function (frm) {
+		const bank_side = {
+			Receive: ["received_amount_after_tax", "received_amount", frm.doc.paid_to_account_currency],
+			Pay: ["paid_amount_after_tax", "paid_amount", frm.doc.paid_from_account_currency],
+		}[frm.doc.payment_type];
+		if (!bank_side) return;
+
+		const [fieldname, amount_field, currency] = bank_side;
+		const taxes = frm.doc.taxes?.length
+			? flt(flt(frm.doc[fieldname]) - flt(frm.doc[amount_field]), precision(fieldname))
+			: 0;
+		let description = "";
+		if (taxes > 0) {
+			description = __("Includes {0} of taxes and charges.", [format_currency(taxes, currency)]);
+		} else if (taxes < 0) {
+			description = __("After deducting {0} of taxes and charges.", [
+				format_currency(-taxes, currency),
+			]);
+		}
+		frm.set_df_property(fieldname, "description", description);
+	},
+
+	set_account_descriptions: function (frm) {
+		const party_account = frm.doc.party_type
+			? __("The {0}'s account.", [__(frm.doc.party_type)])
+			: __("The party's account.");
+		const [paid_from, paid_to] = {
+			Receive: [party_account, __("Bank or cash account the money is received into.")],
+			Pay: [__("Bank or cash account the money is paid from."), party_account],
+			"Internal Transfer": [
+				__("Account the money is transferred from."),
+				__("Account the money is transferred to."),
+			],
+		}[frm.doc.payment_type] || ["", ""];
+
+		frm.set_df_property("paid_from", "description", paid_from);
+		frm.set_df_property("paid_to", "description", paid_to);
+	},
+
+	set_party_description: function (frm) {
+		if (frm.doc.docstatus === 0 && frm.doc.party && !frm.doc.company) {
+			frm.set_df_property(
+				"party",
+				"description",
+				__("Select a Company to fetch this party's details.")
+			);
+			return;
+		}
+
+		const show =
+			frm.doc.docstatus === 0 &&
+			frm.doc.party &&
+			frm.doc.company &&
+			["Customer", "Supplier"].includes(frm.doc.party_type);
+
+		if (!show) {
+			frm.set_df_property("party", "description", "");
+			return;
+		}
+
+		const key = frm.events.get_party_balance_key(frm);
+		const cached = frm.party_balance;
+		if (cached?.key === key) {
+			frm.set_df_property("party", "description", frm.events.get_party_balance_text(frm, cached));
+			return;
+		}
+
+		frappe.call({
+			method: "erpnext.accounts.doctype.payment_entry.payment_entry.get_party_balance",
+			args: {
+				company: frm.doc.company,
+				party_type: frm.doc.party_type,
+				party: frm.doc.party,
+				date: frm.doc.posting_date,
+			},
+			callback: (r) => {
+				if (key !== frm.events.get_party_balance_key(frm)) return;
+				frm.party_balance = { key, ...r.message };
+				frm.events.set_party_description(frm);
+			},
+		});
+	},
+
+	get_party_balance_key: function (frm) {
+		return [frm.doc.name, frm.doc.company, frm.doc.posting_date, frm.doc.party_type, frm.doc.party].join(
+			"\n"
+		);
+	},
+
+	get_party_balance_text: function (frm, { balance, currency }) {
+		if (balance == null) return "";
+
+		const amount = format_currency(Math.abs(balance), currency);
+
+		if (Math.abs(flt(balance)) < 0.005) {
+			return __("Nothing outstanding");
+		}
+		if (frm.doc.party_type === "Customer") {
+			return balance > 0 ? __("Owes {0}", [amount]) : __("Has paid {0} in advance", [amount]);
+		}
+		return balance < 0 ? __("You owe {0}", [amount]) : __("You have paid {0} in advance", [amount]);
+	},
+
+	show_general_ledger: function (frm) {
+		if (frm.doc.docstatus > 0) {
+			frm.add_custom_button(
+				__("Ledger"),
+				function () {
+					frappe.route_options = {
+						voucher_no: frm.doc.name,
+						from_date: frm.doc.posting_date,
+						to_date: moment(frm.doc.modified).format("YYYY-MM-DD"),
+						company: frm.doc.company,
+						categorize_by: "",
+						show_cancelled_entries: frm.doc.docstatus === 2,
+					};
+					frappe.set_route("query-report", "General Ledger");
+				},
+				__("View")
+			);
+		}
+	},
+
+	payment_type: async function (frm) {
 		set_default_party_type(frm);
+		frm.events.set_account_descriptions(frm);
+		frm.events.set_display_labels(frm);
 
 		if (frm.doc.payment_type == "Internal Transfer") {
+			if (frm.doc.party || frm.doc.paid_from || frm.doc.paid_to || frm.doc.references?.length) {
+				frappe.show_alert({
+					message: __("Party, accounts and references were cleared for Internal Transfer"),
+					indicator: "orange",
+				});
+			}
 			$.each(
 				[
 					"party",
@@ -455,17 +722,20 @@ frappe.ui.form.on("Payment Entry", {
 				}
 			);
 		} else {
+			await frm.set_value({ paid_from: null, paid_to: null });
 			if (frm.doc.party) {
-				frm.events.party(frm);
+				frm.trigger("party");
 			}
 
 			if (frm.doc.mode_of_payment) {
 				frm.events.mode_of_payment(frm);
 			}
 		}
+		frm.layout.refresh_section_collapse();
 	},
 
 	mode_of_payment: function (frm) {
+		if (frm.doc.payment_type == "Internal Transfer") return;
 		erpnext.accounts.pos.get_payment_mode_account(frm, frm.doc.mode_of_payment, function (account) {
 			let payment_account_field = frm.doc.payment_type == "Receive" ? "paid_to" : "paid_from";
 			frm.set_value(payment_account_field, account);
@@ -478,6 +748,7 @@ frappe.ui.form.on("Payment Entry", {
 			frm.set_value("party_type", "");
 			frappe.throw(__("Party can only be one of {0}", [party_types.join(", ")]));
 		}
+		frm.events.set_display_labels(frm);
 
 		frm.set_query("party", function () {
 			if (frm.doc.party_type == "Employee") {
@@ -517,6 +788,14 @@ frappe.ui.form.on("Payment Entry", {
 		if (frm.doc.contact_email || frm.doc.contact_person) {
 			frm.set_value("contact_email", "");
 			frm.set_value("contact_person", "");
+		}
+
+		if (!frm.doc.party || !frm.doc.company) {
+			frm.events.set_party_description(frm);
+		}
+
+		if (!frm.doc.party && frm.doc.party_name) {
+			frm.set_value("party_name", "");
 		}
 
 		if (frm.doc.payment_type && frm.doc.party_type && frm.doc.party && frm.doc.company) {
@@ -560,7 +839,18 @@ frappe.ui.form.on("Payment Entry", {
 								}
 							},
 							() => frm.set_value("party_name", r.message.party_name),
-							() => frm.clear_table("references"),
+							() => frm.events.set_party_description(frm),
+							() => {
+								if (frm.doc.references?.length) {
+									frappe.show_alert({
+										message: __(
+											"Invoice rows were cleared because the party or payment type changed"
+										),
+										indicator: "orange",
+									});
+								}
+								frm.clear_table("references");
+							},
 							() => frm.clear_table("tax_withholding_entries"),
 							() => frm.events.hide_unhide_fields(frm),
 							() => frm.events.set_dynamic_labels(frm),
@@ -570,7 +860,13 @@ frappe.ui.form.on("Payment Entry", {
 									frm.set_value("party_bank_account", r.message.party_bank_account);
 								}
 								if (r.message.bank_account) {
-									frm.set_value("bank_account", r.message.bank_account);
+									// Auto-filled default bank account should not override Mode of Payment account
+									frm.set_bank_account_based_on_party = true;
+									return frm
+										.set_value("bank_account", r.message.bank_account)
+										.finally(() => {
+											frm.set_bank_account_based_on_party = false;
+										});
 								}
 							},
 							() =>
@@ -587,6 +883,7 @@ frappe.ui.form.on("Payment Entry", {
 									frm.doc.paid_to_account_currency,
 									company_currency
 								),
+							() => frm.events.set_default_bank_cash_account(frm),
 						]);
 					}
 				},
@@ -619,6 +916,7 @@ frappe.ui.form.on("Payment Entry", {
 					frm.events.paid_amount(frm);
 				}
 				frm.events.paid_from_account_currency(frm);
+				frm.events.sync_references_with_accounts(frm);
 			}
 		);
 	},
@@ -644,12 +942,12 @@ frappe.ui.form.on("Payment Entry", {
 					}
 				}
 				frm.events.paid_to_account_currency(frm);
+				frm.events.sync_references_with_accounts(frm);
 			}
 		);
 	},
 
 	set_account_currency_and_balance: function (frm, account, currency_field, callback_function) {
-		var company_currency = frappe.get_doc(":Company", frm.doc.company).default_currency;
 		if (frm.doc.posting_date && account) {
 			frappe.call({
 				method: "erpnext.accounts.doctype.payment_entry.payment_entry.get_account_details",
@@ -661,6 +959,25 @@ frappe.ui.form.on("Payment Entry", {
 				callback: function (r, rt) {
 					if (r.message) {
 						frappe.run_serially([
+							() => {
+								// bank side amount is re-derived from the party side amount below
+								// when the bank account currency changes
+								if (r.message["account_currency"] == frm.doc[currency_field]) return;
+
+								if (
+									frm.doc.payment_type == "Pay" &&
+									currency_field == "paid_from_account_currency" &&
+									frm.doc.received_amount
+								) {
+									frm.doc.paid_amount = 0;
+								} else if (
+									frm.doc.payment_type == "Receive" &&
+									currency_field == "paid_to_account_currency" &&
+									frm.doc.paid_amount
+								) {
+									frm.doc.received_amount = 0;
+								}
+							},
 							() => frm.set_value(currency_field, r.message["account_currency"]),
 							() => {
 								if (
@@ -684,19 +1001,6 @@ frappe.ui.form.on("Payment Entry", {
 
 									if (!frm.doc.paid_amount && frm.doc.received_amount)
 										frm.events.received_amount(frm);
-
-									if (
-										frm.doc.paid_from_account_currency ==
-											frm.doc.paid_to_account_currency &&
-										frm.doc.paid_amount != frm.doc.received_amount
-									) {
-										if (
-											company_currency != frm.doc.paid_from_account_currency &&
-											frm.doc.payment_type == "Pay"
-										) {
-											frm.doc.paid_amount = frm.doc.received_amount;
-										}
-									}
 								}
 							},
 							() => {
@@ -754,9 +1058,11 @@ frappe.ui.form.on("Payment Entry", {
 	posting_date: function (frm) {
 		frm.events.paid_from_account_currency(frm);
 		frm.events.paid_to_account_currency(frm);
+		frm.events.set_party_description(frm);
 	},
 
 	source_exchange_rate: function (frm) {
+		frm.events.set_exchange_rate_descriptions(frm);
 		frm.set_paid_amount_based_on_received_amount = true;
 		let company_currency = frappe.get_doc(":Company", frm.doc.company).default_currency;
 
@@ -788,6 +1094,7 @@ frappe.ui.form.on("Payment Entry", {
 	},
 
 	target_exchange_rate: function (frm) {
+		frm.events.set_exchange_rate_descriptions(frm);
 		let company_currency = frappe.get_doc(":Company", frm.doc.company).default_currency;
 
 		if (frm.doc.received_amount && frm.doc.target_exchange_rate) {
@@ -857,8 +1164,7 @@ frappe.ui.form.on("Payment Entry", {
 			}
 		}
 
-		if (frm.doc.payment_type == "Pay")
-			frm.events.allocate_party_amount_against_ref_docs(frm, frm.doc.received_amount, true);
+		if (frm.doc.payment_type == "Pay") frm.events.allocate_changed_amount(frm, frm.doc.received_amount);
 		else frm.events.set_unallocated_amount(frm);
 
 		frm.set_paid_amount_based_on_received_amount = false;
@@ -878,89 +1184,158 @@ frappe.ui.form.on("Payment Entry", {
 			frm.set_value("base_received_amount", frm.doc.base_paid_amount);
 		}
 
-		if (frm.doc.payment_type == "Receive")
-			frm.events.allocate_party_amount_against_ref_docs(frm, frm.doc.paid_amount, true);
+		if (frm.doc.payment_type == "Receive") frm.events.allocate_changed_amount(frm, frm.doc.paid_amount);
 		else frm.events.set_unallocated_amount(frm);
 	},
 
+	allocate_changed_amount: function (frm, amount) {
+		const total = Math.abs(
+			(frm.doc.references || []).reduce((sum, row) => sum + flt(row.allocated_amount), 0)
+		);
+		if (!flt(amount) && total) {
+			frm.amount_from_references = frm.doc.name;
+			return frm.events.set_total_allocated_amount(frm);
+		}
+
+		if (frm.events.is_amount_from_references(frm)) {
+			if (flt(amount, precision("paid_amount")) == flt(total, precision("paid_amount"))) {
+				if (frm.doc.taxes?.length) frm.events.apply_taxes(frm);
+				return frm.events.set_unallocated_amount(frm);
+			}
+			frm.amount_from_references = null;
+		}
+		return frm.events.allocate_party_amount_against_ref_docs(frm, amount, true);
+	},
+
+	set_amount_from_references: function (frm, total) {
+		if (!frm.doc.paid_from_account_currency || !frm.doc.paid_to_account_currency) return;
+
+		const amount = flt(total, precision("paid_amount"));
+		const party_amount_field = frm.doc.payment_type == "Receive" ? "paid_amount" : "received_amount";
+		if (flt(frm.doc[party_amount_field], precision(party_amount_field)) == amount) return;
+
+		if (frm.doc.paid_from_account_currency == frm.doc.paid_to_account_currency) {
+			return frm.set_value("paid_amount", amount);
+		}
+		return frm.doc.payment_type == "Receive"
+			? frm.set_value({ received_amount: 0, paid_amount: amount })
+			: frm.set_value({ paid_amount: 0, received_amount: amount });
+	},
+
 	get_outstanding_invoices_or_orders: function (frm, get_outstanding_invoices, get_orders_to_be_billed) {
-		const today = frappe.datetime.get_today();
-		let fields = [
-			{ fieldtype: "Section Break", label: __("Posting Date") },
+		const amount = flt(frm.events.get_party_amount(frm));
+		const ask_to_allocate = amount && !frm.events.is_amount_from_references(frm);
+		const currency =
+			frm.doc.payment_type == "Receive"
+				? frm.doc.paid_from_account_currency
+				: frm.doc.paid_to_account_currency;
+		const formatted_amount = format_currency(amount, currency);
+		const for_invoices = 'eval:doc.document_type != "Orders"';
+		const date_fields = ["from_posting_date", "to_posting_date", "from_due_date", "to_due_date"];
+
+		const left = [
+			{
+				fieldtype: "Date",
+				label: __("From Due Date"),
+				fieldname: "from_due_date",
+				depends_on: for_invoices,
+			},
+			{ fieldtype: "Float", label: __("Outstanding Above"), fieldname: "outstanding_amt_greater_than" },
+		];
+		const right = [
+			{
+				fieldtype: "Date",
+				label: __("To Due Date"),
+				fieldname: "to_due_date",
+				depends_on: for_invoices,
+			},
+			{ fieldtype: "Float", label: __("Outstanding Below"), fieldname: "outstanding_amt_less_than" },
+		];
+		(frm.dimension_filters || []).forEach((elem, idx) => {
+			(idx % 2 ? right : left).push({
+				fieldtype: "Link",
+				label: elem.document_type == "Cost Center" ? __("Cost Center") : elem.label,
+				options: elem.document_type,
+				fieldname: elem.fieldname || elem.document_type,
+			});
+		});
+
+		const fields = [
+			{
+				fieldtype: "Select",
+				label: __("Document Type"),
+				fieldname: "document_type",
+				options: [
+					{ label: __("Invoices"), value: "Invoices" },
+					{ label: __("Orders"), value: "Orders" },
+				],
+				default: get_orders_to_be_billed ? "Orders" : "Invoices",
+				hidden: !["Customer", "Supplier"].includes(frm.doc.party_type),
+				change: () => dialog && update_labels(),
+			},
+			{ fieldtype: "Section Break", depends_on: for_invoices },
 			{
 				fieldtype: "Date",
 				label: __("From Date"),
 				fieldname: "from_posting_date",
-				default: frappe.datetime.add_days(today, -30),
+				description: __("Leave both dates empty to include all open invoices."),
 			},
 			{ fieldtype: "Column Break" },
-			{ fieldtype: "Date", label: __("To Date"), fieldname: "to_posting_date", default: today },
-			{ fieldtype: "Section Break", label: __("Due Date") },
-			{ fieldtype: "Date", label: __("From Date"), fieldname: "from_due_date" },
+			{ fieldtype: "Date", label: __("To Date"), fieldname: "to_posting_date" },
+			{ fieldtype: "Section Break", label: __("More Filters"), collapsible: 1 },
+			...left,
 			{ fieldtype: "Column Break" },
-			{ fieldtype: "Date", label: __("To Date"), fieldname: "to_due_date" },
-			{ fieldtype: "Section Break", label: __("Outstanding Amount") },
-			{
-				fieldtype: "Float",
-				label: __("Greater Than Amount"),
-				fieldname: "outstanding_amt_greater_than",
-				default: 0,
-			},
-			{ fieldtype: "Column Break" },
-			{ fieldtype: "Float", label: __("Less Than Amount"), fieldname: "outstanding_amt_less_than" },
+			...right,
 		];
 
-		if (frm.dimension_filters) {
-			let column_break_insertion_point = Math.ceil(frm.dimension_filters.length / 2);
-
-			fields.push({ fieldtype: "Section Break" });
-			frm.dimension_filters.map((elem, idx) => {
-				fields.push({
-					fieldtype: "Link",
-					label: elem.document_type == "Cost Center" ? "Cost Center" : elem.label,
-					options: elem.document_type,
-					fieldname: elem.fieldname || elem.document_type,
-				});
-				if (idx + 1 == column_break_insertion_point) {
-					fields.push({ fieldtype: "Column Break" });
+		if (ask_to_allocate) {
+			fields.push(
+				{ fieldtype: "Section Break" },
+				{
+					fieldtype: "Check",
+					label: __("Allocate Payment Amount"),
+					fieldname: "allocate_payment_amount",
+					default: 1,
 				}
-			});
+			);
 		}
 
-		fields = fields.concat([
-			{ fieldtype: "Section Break" },
-			{
-				fieldtype: "Check",
-				label: __("Allocate Payment Amount"),
-				fieldname: "allocate_payment_amount",
-				default: 1,
-			},
-		]);
+		const dialog = new frappe.ui.Dialog({
+			title: __("Get Outstanding"),
+			fields: fields,
+			primary_action_label: __("Get"),
+			primary_action: (values) => {
+				const get_orders = values.document_type == "Orders";
+				const filters = { ...values };
+				delete filters.document_type;
+				if (get_orders) date_fields.forEach((field) => delete filters[field]);
 
-		let btn_text = "";
-
-		if (get_outstanding_invoices) {
-			btn_text = "Get Outstanding Invoices";
-		} else if (get_orders_to_be_billed) {
-			btn_text = "Get Outstanding Orders";
-		}
-
-		frappe.prompt(
-			fields,
-			function (filters) {
-				frappe.flags.allocate_payment_amount = true;
 				frm.events.validate_filters_data(frm, filters);
 				frm.doc.cost_center = filters.cost_center;
-				frm.events.get_outstanding_documents(
-					frm,
-					filters,
-					get_outstanding_invoices,
-					get_orders_to_be_billed
-				);
+				if (!ask_to_allocate) filters.allocate_payment_amount = 1;
+				if (!get_orders) filters.limit = 500;
+
+				dialog.hide();
+				frm.events.get_outstanding_documents(frm, filters, !get_orders, get_orders);
 			},
-			__("Filters"),
-			__(btn_text)
-		);
+		});
+
+		const update_labels = () => {
+			const get_orders = dialog.get_value("document_type") == "Orders";
+			dialog.get_primary_btn().text(get_orders ? __("Get Orders") : __("Get Invoices"));
+			if (ask_to_allocate) {
+				dialog.set_df_property(
+					"allocate_payment_amount",
+					"description",
+					get_orders
+						? __("Applies {0} to these orders, oldest first.", [formatted_amount])
+						: __("Applies {0} to these invoices, oldest due first.", [formatted_amount])
+				);
+			}
+		};
+
+		dialog.show();
+		update_labels();
 	},
 
 	get_outstanding_invoices: function (frm) {
@@ -972,33 +1347,19 @@ frappe.ui.form.on("Payment Entry", {
 	},
 
 	validate_filters_data: function (frm, filters) {
-		const fields = {
-			"Posting Date": ["from_posting_date", "to_posting_date"],
-			"Due Date": ["from_posting_date", "to_posting_date"],
-			"Advance Amount": ["from_posting_date", "to_posting_date"],
+		const ranges = {
+			[__("Posting Date")]: ["from_posting_date", "to_posting_date"],
+			[__("Due Date")]: ["from_due_date", "to_due_date"],
 		};
 
-		for (let key in fields) {
-			let from_field = fields[key][0];
-			let to_field = fields[key][1];
-
-			if (filters[from_field] && !filters[to_field]) {
-				frappe.throw(__("Error: {0} is a mandatory field", [to_field.replace(/_/g, " ")]));
-			} else if (filters[from_field] && filters[from_field] > filters[to_field]) {
-				frappe.throw(
-					__("{0}: {1} must be less than {2}", [
-						key,
-						from_field.replace(/_/g, " "),
-						to_field.replace(/_/g, " "),
-					])
-				);
+		for (let [label, [from_field, to_field]] of Object.entries(ranges)) {
+			if (filters[from_field] && filters[to_field] && filters[from_field] > filters[to_field]) {
+				frappe.throw(__("{0}: From Date must be on or before To Date", [label]));
 			}
 		}
 	},
 
 	get_outstanding_documents: function (frm, filters, get_outstanding_invoices, get_orders_to_be_billed) {
-		frm.clear_table("references");
-
 		if (!frm.doc.party) {
 			return;
 		}
@@ -1038,13 +1399,28 @@ frappe.ui.form.on("Payment Entry", {
 				args: args,
 			},
 			callback: function (r, rt) {
+				const key = (doctype, name, payment_term) => [doctype, name, payment_term || ""].join("\n");
+				const existing = new Set(
+					(frm.doc.references || []).map((row) =>
+						key(row.reference_doctype, row.reference_name, row.payment_term)
+					)
+				);
+				const new_rows = [];
+
 				if (r.message) {
-					var total_positive_outstanding = 0;
-					var total_negative_outstanding = 0;
 					$.each(r.message, function (i, d) {
+						if (
+							d.voucher_type == "Payment Entry" ||
+							existing.has(key(d.voucher_type, d.voucher_no, d.payment_term))
+						) {
+							return;
+						}
+
 						var c = frm.add_child("references");
+						new_rows.push(c);
 						c.reference_doctype = d.voucher_type;
 						c.reference_name = d.voucher_no;
+						c.posting_date = d.posting_date;
 						c.due_date = d.due_date;
 						c.total_amount = d.invoice_amount;
 						c.outstanding_amount = d.outstanding_amount;
@@ -1053,12 +1429,6 @@ frappe.ui.form.on("Payment Entry", {
 						c.payment_term_outstanding = d.payment_term_outstanding;
 						c.allocated_amount = d.allocated_amount;
 						c.account = d.account;
-
-						if (!frm.events.get_order_doctypes(frm).includes(d.voucher_type)) {
-							if (flt(d.outstanding_amount) > 0)
-								total_positive_outstanding += flt(d.outstanding_amount);
-							else total_negative_outstanding += Math.abs(flt(d.outstanding_amount));
-						}
 
 						var party_account_currency =
 							frm.doc.payment_type == "Receive"
@@ -1074,33 +1444,49 @@ frappe.ui.form.on("Payment Entry", {
 							c.due_date = d.due_date;
 						}
 					});
-
-					if (
-						(frm.doc.payment_type == "Receive" && frm.doc.party_type == "Customer") ||
-						(frm.doc.payment_type == "Pay" && frm.doc.party_type == "Supplier") ||
-						(frm.doc.payment_type == "Pay" && frm.doc.party_type == "Employee")
-					) {
-						if (total_positive_outstanding > total_negative_outstanding)
-							if (!frm.doc.paid_amount)
-								frm.set_value(
-									"paid_amount",
-									total_positive_outstanding - total_negative_outstanding
-								);
-					} else if (
-						total_negative_outstanding &&
-						total_positive_outstanding < total_negative_outstanding
-					) {
-						if (!frm.doc.received_amount)
-							frm.set_value(
-								"received_amount",
-								total_negative_outstanding - total_positive_outstanding
-							);
-					}
 				}
 
+				if (r.message?.length && !new_rows.length) {
+					frappe.show_alert({
+						message: get_outstanding_invoices
+							? __("No new invoices to add.")
+							: __("No new orders to add."),
+						indicator: "blue",
+					});
+				}
+
+				const open_invoices = new Set(
+					(r.message || [])
+						.filter((d) => flt(d.outstanding_amount) > 0)
+						.map((d) => key(d.voucher_type, d.voucher_no))
+				);
+				if (filters.limit && open_invoices.size >= filters.limit) {
+					frappe.show_alert(
+						{
+							message: __(
+								"Showing the {0} oldest open invoices. Set a From Date to get newer ones.",
+								[filters.limit]
+							),
+							indicator: "blue",
+						},
+						10
+					);
+				}
+
+				if (
+					(!flt(frm.events.get_party_amount(frm)) || frm.events.is_amount_from_references(frm)) &&
+					frm.events.is_outstanding_in_payment_direction(frm)
+				) {
+					frm.amount_from_references = frm.doc.name;
+					return frm.events.allocate_party_amount_against_ref_docs(
+						frm,
+						Math.abs(frm.events.get_invoice_outstanding(frm)),
+						false
+					);
+				}
 				frm.events.allocate_party_amount_against_ref_docs(
 					frm,
-					frm.doc.payment_type == "Receive" ? frm.doc.paid_amount : frm.doc.received_amount,
+					frm.events.get_party_amount(frm),
 					false
 				);
 			},
@@ -1122,6 +1508,9 @@ frappe.ui.form.on("Payment Entry", {
 			allocate_payment_amount: frappe.flags.allocate_payment_amount ?? false,
 		});
 
+		if (frm.doc.taxes?.length) {
+			frm.events.apply_taxes(frm);
+		}
 		frm.events.set_total_allocated_amount(frm);
 	},
 
@@ -1143,10 +1532,18 @@ frappe.ui.form.on("Payment Entry", {
 				);
 			}
 		});
+		const total_outstanding_amount = (frm.doc.references || []).reduce(
+			(total, row) => total + flt(row.outstanding_amount),
+			0
+		);
+		frm.set_value("total_outstanding_amount", flt(total_outstanding_amount, precision("paid_amount")));
 		frm.set_value("total_allocated_amount", Math.abs(total_allocated_amount));
 		frm.set_value("base_total_allocated_amount", Math.abs(base_total_allocated_amount));
 
 		frm.events.set_unallocated_amount(frm);
+		if (frm.events.is_amount_from_references(frm)) {
+			return frm.events.set_amount_from_references(frm, Math.abs(total_allocated_amount));
+		}
 	},
 
 	set_unallocated_amount: function (frm) {
@@ -1192,13 +1589,15 @@ frappe.ui.form.on("Payment Entry", {
 			(frm.doc.payment_type == "Receive" ? frm.doc.source_exchange_rate : frm.doc.target_exchange_rate);
 
 		var base_party_amount = flt(frm.doc.base_total_allocated_amount) + base_unallocated_amount;
+		const included_taxes = get_included_taxes(frm);
 
 		if (frm.doc.payment_type == "Receive") {
-			difference_amount = base_party_amount - flt(frm.doc.base_received_amount);
+			difference_amount = base_party_amount - flt(frm.doc.base_received_amount) + included_taxes;
 		} else if (frm.doc.payment_type == "Pay") {
-			difference_amount = flt(frm.doc.base_paid_amount) - base_party_amount;
+			difference_amount = flt(frm.doc.base_paid_amount) - base_party_amount - included_taxes;
 		} else {
-			difference_amount = flt(frm.doc.base_paid_amount) - flt(frm.doc.base_received_amount);
+			difference_amount =
+				flt(frm.doc.base_paid_amount) - flt(frm.doc.base_received_amount) - included_taxes;
 		}
 
 		var total_deductions = frappe.utils.sum(
@@ -1207,12 +1606,55 @@ frappe.ui.form.on("Payment Entry", {
 			})
 		);
 
-		frm.set_value(
-			"difference_amount",
-			difference_amount - total_deductions + flt(frm.doc.base_total_taxes_and_charges)
-		);
+		frm.set_value("difference_amount", difference_amount - total_deductions);
 
 		frm.events.hide_unhide_fields(frm);
+		frm.events.set_difference_description(frm);
+		frm.layout.refresh_section_collapse();
+	},
+
+	set_difference_description: function (frm) {
+		const doc = frm.doc;
+		let description = "";
+
+		const deductions = frappe.utils.sum((doc.deductions || []).map((row) => flt(row.amount)));
+		const explain_deductions =
+			doc.docstatus === 0 &&
+			["Receive", "Pay"].includes(doc.payment_type) &&
+			flt(doc.difference_amount) &&
+			deductions &&
+			!get_included_taxes(frm);
+
+		if (explain_deductions) {
+			const currency = frappe.get_doc(":Company", doc.company)?.default_currency;
+			const format = (value) => format_currency(value, currency);
+			const exchange_rate =
+				doc.payment_type == "Receive" ? doc.source_exchange_rate : doc.target_exchange_rate;
+			const settled =
+				flt(doc.base_total_allocated_amount) + flt(doc.unallocated_amount) * flt(exchange_rate);
+
+			description =
+				doc.payment_type == "Receive"
+					? __("{0} received + {1} deductions = {2}, but the invoices and advance add up to {3}.", [
+							format(doc.base_received_amount),
+							format(deductions),
+							format(flt(doc.base_received_amount) + deductions),
+							format(settled),
+					  ])
+					: __("{0} paid − {1} deductions = {2}, but the invoices and advance add up to {3}.", [
+							format(doc.base_paid_amount),
+							format(deductions),
+							format(flt(doc.base_paid_amount) - deductions),
+							format(settled),
+					  ]);
+		}
+
+		const control = frm.fields_dict.difference_amount;
+		if (description) {
+			control.set_new_description(description);
+		} else {
+			control.set_empty_description();
+		}
 	},
 
 	unallocated_amount: function (frm) {
@@ -1276,6 +1718,10 @@ frappe.ui.form.on("Payment Entry", {
 
 	base_paid_amount: function (frm) {
 		frm.events.set_exchange_gain_loss_deduction(frm);
+		if (frm.doc.taxes?.length) {
+			frm.events.apply_taxes(frm);
+			frm.events.set_unallocated_amount(frm);
+		}
 	},
 
 	base_received_amount: function (frm) {
@@ -1358,21 +1804,47 @@ frappe.ui.form.on("Payment Entry", {
 		row.amount = flt(row.amount) + difference_amount;
 		frm.refresh_field("deductions");
 		frm.events.set_unallocated_amount(frm);
+
+		frappe.show_alert({
+			message: __("Wrote off {0} to {1}", [
+				format_currency(
+					Math.abs(difference_amount),
+					frappe.get_doc(":Company", frm.doc.company).default_currency
+				),
+				write_off_account,
+			]),
+			indicator: "green",
+		});
 	},
 
 	bank_account: function (frm) {
-		if (frm.set_company_bank_account_based_on_coa) return;
+		if (frm.set_company_bank_account_based_on_coa) {
+			frm.set_company_bank_account_based_on_coa = false;
+			return;
+		}
 
-		const field = frm.doc.payment_type == "Pay" ? "paid_from" : "paid_to";
-		if (frm.doc.bank_account && ["Pay", "Receive"].includes(frm.doc.payment_type)) {
+		// Only the current event is an automatic selection; later user edits must take precedence.
+		const auto_filled = frm.set_bank_account_based_on_party;
+		frm.set_bank_account_based_on_party = false;
+		const { bank_account, company, payment_type, mode_of_payment } = frm.doc;
+		const field = payment_type == "Pay" ? "paid_from" : "paid_to";
+		if (bank_account && ["Pay", "Receive"].includes(payment_type)) {
 			frappe.call({
 				method: "erpnext.accounts.doctype.bank_account.bank_account.get_bank_account_details",
 				args: {
-					bank_account: frm.doc.bank_account,
+					bank_account,
 				},
 				callback: function (r) {
+					if (
+						frm.doc.bank_account != bank_account ||
+						frm.doc.company != company ||
+						frm.doc.payment_type != payment_type ||
+						frm.doc.mode_of_payment != mode_of_payment
+					)
+						return;
+
 					if (r.message) {
-						if (!frm.doc.mode_of_payment) {
+						if (!auto_filled || !mode_of_payment) {
 							frm.set_value(field, r.message.account);
 						} else {
 							frappe.call({
@@ -1380,13 +1852,21 @@ frappe.ui.form.on("Payment Entry", {
 								args: {
 									doctype: "Mode of Payment Account",
 									filters: {
-										parent: frm.doc.mode_of_payment,
-										company: frm.doc.company,
+										parent: mode_of_payment,
+										company,
 									},
 									fieldname: "default_account",
 									parent: "Mode of Payment",
 								},
 								callback: function (res) {
+									if (
+										frm.doc.bank_account != bank_account ||
+										frm.doc.company != company ||
+										frm.doc.payment_type != payment_type ||
+										frm.doc.mode_of_payment != mode_of_payment
+									)
+										return;
+
 									if (!res.message.default_account) {
 										frm.set_value(field, r.message.account);
 									}
@@ -1408,23 +1888,35 @@ frappe.ui.form.on("Payment Entry", {
 
 		if (!frm.doc.company || !frm.doc[field]) return;
 
-		frm.set_company_bank_account_based_on_coa = true;
+		const account = frm.doc[field];
+		const { bank_account, company, payment_type } = frm.doc;
 
 		frappe.call({
 			method: "frappe.client.get_value",
 			args: {
 				doctype: "Bank Account",
 				filters: {
-					company: frm.doc.company,
-					account: frm.doc[field],
+					company,
+					account,
 					disabled: 0,
 				},
 				fieldname: ["name"],
 			},
-			callback: async function (r) {
-				if (r.message) await frm.set_value("bank_account", r.message.name);
+			callback: function (r) {
+				if (
+					frm.doc[field] != account ||
+					frm.doc.bank_account != bank_account ||
+					frm.doc.company != company ||
+					frm.doc.payment_type != payment_type
+				)
+					return;
 
-				frm.set_company_bank_account_based_on_coa = false;
+				if (r.message) {
+					frm.set_company_bank_account_based_on_coa = true;
+					return frm.set_value("bank_account", r.message.name).finally(() => {
+						frm.set_company_bank_account_based_on_coa = false;
+					});
+				}
 			},
 		});
 	},
@@ -1480,12 +1972,34 @@ frappe.ui.form.on("Payment Entry", {
 		frm.events.initialize_taxes(frm);
 		frm.events.determine_exclusive_rate(frm);
 		frm.events.calculate_taxes(frm);
+		frm.events.set_amounts_after_tax(frm);
+	},
+
+	set_amounts_after_tax: function (frm) {
+		const base_applicable_tax = (frm.doc.taxes || [])
+			.filter((tax) => !tax.included_in_paid_amount)
+			.reduce(
+				(total, tax) => total + (tax.add_deduct_tax == "Deduct" ? -1 : 1) * flt(tax.base_tax_amount),
+				0
+			);
+
+		frm.doc.paid_amount_after_tax = flt(
+			flt(frm.doc.paid_amount) + base_applicable_tax / flt(frm.doc.source_exchange_rate),
+			precision("paid_amount_after_tax")
+		);
+		frm.doc.received_amount_after_tax = flt(
+			flt(frm.doc.received_amount) + base_applicable_tax / flt(frm.doc.target_exchange_rate),
+			precision("received_amount_after_tax")
+		);
+		frm.refresh_field("paid_amount_after_tax");
+		frm.refresh_field("received_amount_after_tax");
+		frm.events.set_bank_total_description(frm);
 	},
 
 	initialize_taxes: function (frm) {
 		$.each(frm.doc["taxes"] || [], function (i, tax) {
 			frm.events.validate_taxes_and_charges(tax);
-			frm.events.validate_inclusive_tax(tax);
+			frm.events.validate_inclusive_tax(tax, frm);
 			let tax_fields = [
 				"total",
 				"tax_fraction_for_current_item",
@@ -1548,7 +2062,7 @@ frappe.ui.form.on("Payment Entry", {
 		}
 	},
 
-	validate_inclusive_tax: function (tax) {
+	validate_inclusive_tax: function (tax, frm) {
 		let actual_type_error = function () {
 			let msg = __("Actual type tax cannot be included in Item rate in row {0}", [tax.idx]);
 			frappe.throw(msg);
@@ -1570,12 +2084,12 @@ frappe.ui.form.on("Payment Entry", {
 				actual_type_error();
 			} else if (
 				tax.charge_type == "On Previous Row Amount" &&
-				!cint(this.frm.doc["taxes"][tax.row_id - 1].included_in_paid_amount)
+				!cint(frm.doc["taxes"][tax.row_id - 1].included_in_paid_amount)
 			) {
 				// referred row should also be an inclusive tax
 				on_previous_row_error(tax.row_id);
 			} else if (tax.charge_type == "On Previous Row Total") {
-				let taxes_not_included = $.map(this.frm.doc["taxes"].slice(0, tax.row_id), function (t) {
+				let taxes_not_included = $.map(frm.doc["taxes"].slice(0, tax.row_id), function (t) {
 					return cint(t.included_in_paid_amount) ? null : t;
 				});
 				if (taxes_not_included.length > 0) {
@@ -1726,7 +2240,15 @@ frappe.ui.form.on("Payment Entry", {
 		return current_tax_amount;
 	},
 
+	before_save: function (frm) {
+		frm.amount_follows_references_on_save = frm.events.is_amount_from_references(frm);
+	},
+
 	after_save: function (frm) {
+		if (frm.amount_follows_references_on_save) {
+			frm.amount_from_references = frm.doc.name;
+		}
+
 		const { matched_payment_requests } = frappe.last_response;
 		if (!matched_payment_requests) return;
 
@@ -1801,6 +2323,7 @@ frappe.ui.form.on("Payment Entry Reference", {
 							: frm.doc.paid_to_account_currency,
 					party_type: frm.doc.party_type,
 					party: frm.doc.party,
+					party_account: frm.doc.payment_type == "Receive" ? frm.doc.paid_from : frm.doc.paid_to,
 				},
 				callback: function (r, rt) {
 					if (r.message) {

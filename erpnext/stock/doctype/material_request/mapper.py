@@ -7,6 +7,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.model.mapper import get_mapped_doc
+from frappe.query_builder.functions import Sum
 from frappe.utils import cint, comma_and, flt, get_link_to_form, getdate, nowdate
 
 from erpnext.controllers.mapper import get_qty_already_mapped
@@ -36,6 +37,11 @@ def get_source_item_for_qty(item, qty):
 	return source_item
 
 
+def validate_request_not_stopped(source_name):
+	if frappe.db.get_value("Material Request", source_name, "status") == "Stopped":
+		frappe.throw(_("Material Request {0} is stopped").format(source_name), frappe.InvalidStatusError)
+
+
 def update_item(obj, target, source_parent):
 	target.conversion_factor = obj.conversion_factor
 
@@ -46,7 +52,7 @@ def update_item(obj, target, source_parent):
 		target.schedule_date = None
 
 	if target.fg_item:
-		target.fg_item_qty = obj.stock_qty
+		target.fg_item_qty = target.stock_qty
 		if sc_bom := get_subcontracting_boms_for_finished_goods(target.fg_item):
 			target.item_code = sc_bom.service_item
 			target.uom = sc_bom.service_item_uom
@@ -62,10 +68,27 @@ def update_item(obj, target, source_parent):
 			target.stock_qty = target.qty * target.conversion_factor
 
 
+def notify_missing_service_items(purchase_order):
+	finished_goods = list(
+		dict.fromkeys(d.fg_item for d in purchase_order.items if d.fg_item and not d.item_code)
+	)
+	if not finished_goods:
+		return
+
+	frappe.msgprint(
+		_(
+			"No active Subcontracting BOM found for Finished Good {0}. Please select the Service Item manually for these rows."
+		).format(comma_and([get_link_to_form("Item", fg_item) for fg_item in finished_goods])),
+		title=_("Service Item Not Set"),
+		indicator="orange",
+	)
+
+
 @frappe.whitelist()
 def make_purchase_order(
 	source_name: str, target_doc: str | dict | Document | None = None, args: dict | str | None = None
 ):
+	validate_request_not_stopped(source_name)
 	if args is None:
 		args = frappe.flags.args or {}
 	args = frappe.parse_json(args)
@@ -87,6 +110,9 @@ def make_purchase_order(
 		if obj.name in requested_qty:
 			obj = get_source_item_for_qty(obj, requested_qty[obj.name])
 		update_item(obj, target, source_parent)
+		if not target.rate and not target.price_list_rate:
+			# unpriced rows fetch the price for the Purchase Order's supplier
+			target.rate = target.price_list_rate = None
 
 	def select_item(d):
 		filtered_items = args.get("filtered_children", [])
@@ -135,12 +161,17 @@ def make_purchase_order(
 		postprocess,
 	)
 
+	if is_subcontracted:
+		notify_missing_service_items(doclist)
+
 	doclist.set_onload("load_after_mapping", False)
 	return doclist
 
 
 @frappe.whitelist()
 def make_request_for_quotation(source_name: str, target_doc: str | dict | Document | None = None):
+	validate_request_not_stopped(source_name)
+
 	def update_item(obj, target, source_parent):
 		qty = obj.ordered_qty or obj.received_qty
 		target.qty = flt(flt(obj.stock_qty) - flt(qty)) / target.conversion_factor
@@ -291,18 +322,24 @@ def make_purchase_orders_by_supplier(source_name: str, item_suppliers: str | lis
 
 @frappe.whitelist()
 def get_items_based_on_default_supplier(supplier: str):
-	supplier_items = [
-		d.parent
-		for d in frappe.db.get_all(
-			"Item Default", {"default_supplier": supplier, "parenttype": "Item"}, "parent"
-		)
-	]
+	frappe.has_permission("Item", "select", throw=True)
+	# Child rows are only candidates; return names allowed by the parent Item permissions.
+	supplier_items = frappe.get_all(
+		"Item Default", {"default_supplier": supplier, "parenttype": "Item"}, pluck="parent"
+	)
+	if not supplier_items:
+		return []
 
-	return supplier_items
+	permitted_items = set(
+		frappe.get_list("Item", filters={"name": ["in", supplier_items]}, pluck="name", limit=0)
+	)
+	return [item for item in supplier_items if item in permitted_items]
 
 
 @frappe.whitelist()
 def make_supplier_quotation(source_name: str, target_doc: str | dict | Document | None = None):
+	validate_request_not_stopped(source_name)
+
 	def postprocess(source, target_doc):
 		set_missing_values(source, target_doc)
 
@@ -321,6 +358,7 @@ def make_supplier_quotation(source_name: str, target_doc: str | dict | Document 
 					"parent": "material_request",
 					"sales_order": "sales_order",
 				},
+				"condition": lambda doc: flt(doc.ordered_qty or doc.received_qty) < flt(doc.stock_qty),
 			},
 		},
 		target_doc,
@@ -333,6 +371,8 @@ def make_supplier_quotation(source_name: str, target_doc: str | dict | Document 
 
 @frappe.whitelist()
 def make_stock_entry(source_name: str, target_doc: str | dict | Document | None = None):
+	validate_request_not_stopped(source_name)
+
 	def update_item(obj, target, source_parent):
 		qty = (
 			flt(flt(obj.stock_qty) - flt(obj.ordered_qty)) / target.conversion_factor
@@ -398,8 +438,9 @@ def make_stock_entry(source_name: str, target_doc: str | dict | Document | None 
 				target.bom_no = work_order_details.bom_no
 				target.use_multi_level_bom = work_order_details.use_multi_level_bom
 				target.from_bom = 1
-				# not fg-qty-driven, mirrors the Pick List -> Stock Entry transfer for this Work Order
-				target.fg_completed_qty = 0
+				if not source.job_card:
+					# not fg-qty-driven, mirrors the Pick List -> Stock Entry transfer for this Work Order
+					target.fg_completed_qty = 0
 
 	doclist = get_mapped_doc(
 		"Material Request",
@@ -438,10 +479,37 @@ def make_stock_entry(source_name: str, target_doc: str | dict | Document | None 
 	return doclist
 
 
+def get_open_pick_qty(material_request: str) -> dict[str, float]:
+	"""Stock qty picked on submitted pick lists but not yet transferred, per request row."""
+	pick_list = frappe.qb.DocType("Pick List")
+	pick_list_item = frappe.qb.DocType("Pick List Item")
+	rows = (
+		frappe.qb.from_(pick_list_item)
+		.join(pick_list)
+		.on(pick_list.name == pick_list_item.parent)
+		.select(
+			pick_list_item.material_request_item,
+			Sum(pick_list_item.picked_qty - pick_list_item.transferred_qty),
+		)
+		.where((pick_list.docstatus == 1) & (pick_list_item.material_request == material_request))
+		.groupby(pick_list_item.material_request_item)
+	).run()
+
+	return {row_name: flt(qty) for row_name, qty in rows}
+
+
+def get_pending_pick_qty(row, open_pick_qty: dict[str, float]):
+	# ordered_qty already holds what open picks transferred, so add only the untransferred part
+	return flt(row.stock_qty) - flt(row.ordered_qty) - flt(open_pick_qty.get(row.name))
+
+
 @frappe.whitelist()
 def create_pick_list(source_name: str, target_doc: str | dict | Document | None = None):
+	validate_request_not_stopped(source_name)
+	open_pick_qty = get_open_pick_qty(source_name)
+
 	def update_item(obj, target, source_parent):
-		qty = flt((obj.stock_qty - obj.picked_qty) / target.conversion_factor, obj.precision("qty"))
+		qty = flt(get_pending_pick_qty(obj, open_pick_qty) / target.conversion_factor, obj.precision("qty"))
 		target.qty = qty
 		target.stock_qty = qty * obj.conversion_factor
 		target.conversion_factor = obj.conversion_factor
@@ -453,7 +521,7 @@ def create_pick_list(source_name: str, target_doc: str | dict | Document | None 
 			"Material Request": {
 				"doctype": "Pick List",
 				"field_map": {"material_request_type": "purpose"},
-				"validation": {"docstatus": ["=", 1]},
+				"validation": {"docstatus": ["=", 1], "material_request_type": ["=", "Material Transfer"]},
 			},
 			"Material Request Item": {
 				"doctype": "Pick List Item",
@@ -464,15 +532,15 @@ def create_pick_list(source_name: str, target_doc: str | dict | Document | None 
 				},
 				"postprocess": update_item,
 				"condition": lambda doc: (
-					flt(doc.picked_qty, doc.precision("picked_qty"))
-					< flt(doc.stock_qty, doc.precision("stock_qty"))
+					flt(get_pending_pick_qty(doc, open_pick_qty), doc.precision("stock_qty")) > 0
 				),
 			},
 		},
 		target_doc,
 	)
 
-	doc.set_item_locations()
+	if not doc.pick_manually:
+		doc.set_item_locations()
 
 	return doc
 

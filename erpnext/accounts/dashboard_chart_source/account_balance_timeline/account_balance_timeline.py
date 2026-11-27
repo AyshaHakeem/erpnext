@@ -39,12 +39,15 @@ def get(
 	account = filters.get("account")
 	company = filters.get("company")
 
-	if not company and not account:
-		frappe.throw(_("Company and account filters not set!"))
+	# the account defaults to the company's default bank account, which a new company has not set yet
 	if not company:
-		frappe.throw(_("Company filter not set!"))
+		frappe.throw(_("Choose a company in this chart's filters to see its bank balance."))
 	if not account:
-		frappe.throw(_("Account filter not set!"))
+		frappe.throw(
+			_(
+				"Choose a bank account in this chart's filters, or set a default bank account on {0}, to see its balance."
+			).format(company)
+		)
 
 	# authorise the account itself, as get_balance_on() does; doc= brings User Permissions with it
 	frappe.has_permission("Account", doc=account, throw=True)
@@ -125,6 +128,8 @@ def get_dates_from_timegrain(from_date, to_date, timegrain):
 		months = 1
 	elif "Quarterly" == timegrain:
 		months = 3
+	elif "Yearly" == timegrain:
+		years = 1
 
 	dates = [get_period_ending(from_date, timegrain)]
 	while getdate(dates[-1]) < getdate(to_date):
